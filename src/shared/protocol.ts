@@ -4,7 +4,7 @@ import type { Settings } from './settings';
 export const PROTOCOL_VERSION = 4;
 export const TICK_HZ = 60;
 export const SNAP_EVERY = 1;
-export const INPUT_HZ = 30;
+export const INPUT_HZ = 60;
 /** Clients sample the pointer once per tick and send the samples in batches at INPUT_HZ, so the server can move the mallet every tick. */
 export const SAMPLE_HZ = TICK_HZ;
 /** The most samples one input message may carry. */

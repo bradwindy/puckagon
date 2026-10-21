@@ -57,6 +57,12 @@ function playerId(): string {
   return pid;
 }
 
+/** `?ahead=40` in the page URL draws a match at most this many ms ahead of the server, to compare against the default. */
+function aheadFromQuery(search: string): number {
+  const n = Number(new URLSearchParams(search).get('ahead') || NaN);
+  return n >= 0 ? n : Infinity;
+}
+
 const savedName = () => sanitizeName(storageGet(() => localStorage, NAME_KEY));
 const saveName = (name: string) => storageSet(() => localStorage, NAME_KEY, sanitizeName(name));
 
@@ -113,7 +119,7 @@ class Attract {
 }
 
 class PartySession {
-  readonly state = new GameState();
+  readonly state = new GameState(aheadFromQuery(location.search));
   readonly net: Net;
   status: NetStatus = 'connecting';
   pointer: Vec | null = null;

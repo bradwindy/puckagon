@@ -90,6 +90,9 @@ interface Fired {
 }
 
 export class GameState {
+  /** `aheadMs` caps how far ahead of the server's newest state a match is drawn. Below local time your mallet trails your hand. */
+  constructor(private aheadMs = Infinity) {}
+
   room: RoomMsg | null = null;
   myId = '';
   layout: Layout | null = null;
@@ -258,7 +261,8 @@ export class GameState {
     const from = known ? this.puckTick : past;
     const ticks = dt / TICK_MS;
     const steady = from + ticks;
-    const target = lead ? lead.L : past;
+    const cap = Number.isFinite(this.aheadMs) ? (now - this.offset + this.aheadMs) / TICK_MS : Infinity;
+    const target = lead ? Math.min(lead.L, cap) : past;
     const resync = target > from && Math.abs(target - steady) > RESYNC_TICKS;
     this.puckTick = Math.max(from, resync ? target : clamp(target, steady - FOLLOW_RATE * ticks, steady + FOLLOW_RATE * ticks));
     const tick = this.puckTick;
@@ -286,10 +290,12 @@ export class GameState {
       this.offsetX += was.x - is.x;
       this.offsetY += was.y - is.y;
     }
+    const mallets = this.malletsOf(tick, newest, pred, !!lead);
     if (base?.pred && pred && base.snap !== newest) {
       const old = predict?.(base.snap, base.live) ?? base.pred;
-      pred.mallets.forEach((m, seat) => {
-        const was = old.mallets[seat];
+      const before = this.malletsOf(tick, base.snap, old, base.predicted);
+      mallets.forEach((m, seat) => {
+        const was = before[seat];
         if (!m || !was || seat === pred.seat) return;
         const o = (this.malletOffsets[seat] ??= { x: 0, y: 0 });
         o.x += was.x - m.x;
@@ -319,9 +325,9 @@ export class GameState {
     return {
       puck: hidden ? null : { x: state.x + this.offsetX, y: state.y + this.offsetY },
       speed: Math.hypot(state.vx, state.vy),
-      mallets: pred ? pred.mallets.map((m, seat) => m && this.smoothed(m, seat)) : this.malletsAt(past),
+      mallets: pred ? mallets.map((m, seat) => m && this.smoothed(m, seat)) : this.malletsAt(past),
       hitter: state.hitter,
-      mallet: pred?.mallet ?? null,
+      mallet: pred ? mallets[pred.seat] : null,
       due,
       served,
     };
@@ -329,6 +335,26 @@ export class GameState {
 
   private visibleAt(k: number): boolean {
     return k < this.hiddenFrom || k >= this.showFrom;
+  }
+
+  /**
+   * Every mallet at the puck's tick: from the snapshots up to `base`, then from the prediction. Before the puck is in
+   * play they are drawn at local time.
+   */
+  private malletsOf(t: number, base: Snap, pred: Prediction | null, live: boolean): (Vec | null)[] {
+    if (!pred) return this.malletsAt(t);
+    if (!live) return pred.mallets;
+    if (t <= base.k) return this.malletsAt(t);
+    const s = pred.steps;
+    let i = 0;
+    while (i < s.length - 2 && s[i + 1].t <= t) i++;
+    const a = s[i];
+    const b = s[i + 1] ?? a;
+    const f = b.t > a.t ? clamp((t - a.t) / (b.t - a.t), 0, 1) : 0;
+    return a.mallets.map((ma, seat) => {
+      const mb = b.mallets[seat];
+      return ma && mb ? { x: ma.x + (mb.x - ma.x) * f, y: ma.y + (mb.y - ma.y) * f } : ma;
+    });
   }
 
   private smoothed(m: Vec, seat: number): Vec {

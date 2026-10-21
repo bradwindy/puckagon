@@ -98,7 +98,7 @@ function snap(k: number, e: WireEvent[] = []): SnapMsg {
 function line(s: Snap, lead: number, events: { k: number; e: WireEvent }[] = []): Prediction {
   const L = s.k + lead;
   const puck = Array.from({ length: lead + 3 }, (_, i) => state(s.k + i));
-  return { seat: 0, k: s.k, L, puck, events: events.filter((e) => e.k > s.k), goal: Infinity, mallet: { x: 0, y: 0.7 }, mallets: [] };
+  return { seat: 0, k: s.k, L, puck, events: events.filter((e) => e.k > s.k), goal: Infinity, mallet: { x: 0, y: 0.7 }, mallets: [], steps: puck.map((p) => ({ t: p.t, mallets: [] })) };
 }
 
 interface Frame {
@@ -141,8 +141,8 @@ function play(
   return frames;
 }
 
-function playing(): GameState {
-  const st = new GameState();
+function playing(aheadMs?: number): GameState {
+  const st = new GameState(aheadMs);
   st.onRoom(ROOM);
   return st;
 }
@@ -168,6 +168,13 @@ describe('display timeline', () => {
     expect(Math.abs(at(240).local - at(240).tick)).toBeLessThan(0.01);
     expect(Math.abs(at(390).local - at(390).tick)).toBeLessThan(0.01);
     expect(Math.abs(at(500).local - at(500).tick)).toBeLessThan(0.01);
+  });
+
+  it('with ?ahead= draws no further ahead of the server than asked', () => {
+    // Snapshots arrive LATENCY_MS after their tick, so the newest one is the server's latest state.
+    const frames = play(playing(50), 1, 400, { lead: () => 12, predicting: (k) => k >= 100 });
+    const f = frames.find((f) => f.k >= 300)!;
+    expect(Math.abs(f.tick - (f.k + 50 / TICK_MS))).toBeLessThan(1);
   });
 });
 

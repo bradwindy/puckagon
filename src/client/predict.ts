@@ -45,6 +45,8 @@ export interface Prediction {
   mallet: Vec;
   /** Every mallet at L, by seat. */
   mallets: (Vec | null)[];
+  /** Every mallet at each tick from k to a little past L. */
+  steps: { t: number; mallets: (Vec | null)[] }[];
 }
 
 export interface PredictInput {
@@ -85,8 +87,9 @@ export function predict(input: PredictInput): Prediction | null {
   world.lastHitter = snap.hitter;
   world.frozen = !input.live;
 
-  const out: Prediction = { seat, k: snap.k, L: snap.k, puck: [], events: [], goal: Infinity, mallet: { x: 0, y: 0 }, mallets: [] };
+  const out: Prediction = { seat, k: snap.k, L: snap.k, puck: [], events: [], goal: Infinity, mallet: { x: 0, y: 0 }, mallets: [], steps: [] };
   const record = (t: number) => {
+    out.steps.push({ t, mallets: world.mallets.map((m) => (m ? { x: m.x, y: m.y } : null)) });
     if (!input.live) return;
     const { puck } = world;
     out.puck.push({ t, x: puck.x, y: puck.y, vx: puck.vx, vy: puck.vy, hitter: world.lastHitter });
@@ -120,7 +123,7 @@ export function predict(input: PredictInput): Prediction | null {
   const mallet = world.mallets[seat]!;
   out.mallet = { x: mallet.x, y: mallet.y };
   out.mallets = world.mallets.map((m) => (m ? { x: m.x, y: m.y } : null));
-  if (input.live) for (let i = 1; i <= EXTRA_TICKS; i++) advance(input.pointer, DT, out.L + i);
+  for (let i = 1; i <= EXTRA_TICKS; i++) advance(input.pointer, DT, out.L + i);
   return out;
 }
 

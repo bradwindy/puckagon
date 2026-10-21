@@ -79,7 +79,7 @@ const INPUT_QUEUE = 4;
  * A player who always had a sample to spare over this many ticks skips one, so the wait a burst of messages leaves
  * behind drains away instead of adding lag for the rest of the match.
  */
-const DRAIN_TICKS = 15;
+const DRAIN_TICKS = 8;
 /** A puck jammed against a mallet makes a hit every tick. Only one hit per seat this many ticks apart reaches clients. */
 const HIT_EVENT_GAP = 4;
 /**
