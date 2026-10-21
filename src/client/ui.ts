@@ -423,7 +423,7 @@ export class UI {
     const winner = room.players.find((p) => p.id === room.winner);
     const seated = room.players.filter((p) => p.seat >= 0);
     const standings = [...seated].sort((a, b) =>
-      room.settings.mode === 'lives' ? b.lives - a.lives || Number(a.out) - Number(b.out) : b.score - a.score,
+      room.settings.mode === 'lives' ? Number(a.out) - Number(b.out) || b.lives - a.lives : b.score - a.score,
     );
     this.panel!.classList.remove('mini');
     this.panel!.replaceChildren(
@@ -442,7 +442,7 @@ export class UI {
             {},
             h('span', { class: 'dot', style: { '--c': PALETTE[p.color] } }),
             h('span', { class: 'name' }, p.name),
-            h('span', { class: 'pts' }, room.settings.mode === 'lives' ? `${p.lives} ♥` : String(p.score)),
+            h('span', { class: 'pts' }, room.settings.mode === 'lives' ? (p.out ? 'out' : `${p.lives} ♥`) : String(p.score)),
           ),
         ),
       ),
