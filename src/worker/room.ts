@@ -4,6 +4,7 @@ import {
   COUNTDOWN_MS,
   PALETTE,
   LOBBY_GRACE_MS,
+  MAX_SAMPLES,
   RECONNECT_GRACE_MS,
   round,
   SCORED_MS,
@@ -19,6 +20,7 @@ import {
 } from '../shared/protocol';
 import { resolveGoal } from '../shared/rules';
 import { DEFAULT_SETTINGS, sanitizeSettings, type Settings } from '../shared/settings';
+import type { Vec } from '../shared/vec';
 import { BOT_NAMES, botTarget, newBrain, type BotBrain } from './bot';
 
 export interface RoomIO {
@@ -58,6 +60,18 @@ const ticks = (ms: number) => Math.round(ms / STEP_MS);
 const COUNTDOWN_TICKS = ticks(COUNTDOWN_MS);
 const SCORED_TICKS = ticks(SCORED_MS);
 const MATCH_PHASES: Phase[] = ['countdown', 'playing', 'scored'];
+/** Pointer samples a player may have waiting. More would add lag after a burst of late messages. */
+const INPUT_QUEUE = 4;
+/** A puck jammed against a mallet makes a hit every tick. Only one hit per seat this many ticks apart reaches clients. */
+const HIT_EVENT_GAP = 4;
+/**
+ * A held puck touches the same spot every tick. An event this close to one of the last few with the same seat (walls
+ * share one key), within this many ticks of it, is the same contact and stays quiet for as long as the hold lasts.
+ */
+const SAME_SPOT = 0.02;
+const SAME_SPOT_TICKS = 30;
+const SPOTS_KEPT = 4;
+const MAX_PING_MS = 9999;
 /** Twelve seats plus a bench. Joins past this are turned away. */
 export const MAX_PLAYERS = 24;
 
@@ -79,6 +93,10 @@ export class Room {
   private tickCount = 0;
   private pending: WireEvent[] = [];
   private brains = new Map<string, BotBrain>();
+  private inputs = new Map<string, Vec[]>();
+  private spots = new Map<number, { k: number; x: number; y: number }[]>();
+  /** Last ping shown to the room, by pid. Kept off Player so it is never written to storage. */
+  private pings = new Map<string, number>();
 
   constructor(private io: RoomIO) {}
 
@@ -100,10 +118,11 @@ export class Room {
   /**
    * Rebuilds after the Durable Object wakes. Players whose socket is gone get a fresh reconnect grace,
    * so a close that woke the object, or a deploy restart, still runs through the normal leave path.
-   * A match can't survive a restart, so it falls back to the lobby.
+   * A match can't survive a restart, so it falls back to the lobby. `pings` holds the last ping shown for live players.
    */
-  restore(snap: RoomSnapshot, livePids: Set<string>, now: number): void {
+  restore(snap: RoomSnapshot, livePids: Set<string>, now: number, pings: Map<string, number>): void {
     this.settings = sanitizeSettings(snap.settings);
+    this.pings = pings;
     this.players = snap.players.map((p) => {
       const bot = p.bot ?? null;
       const connected = bot !== null || livePids.has(p.pid);
@@ -132,6 +151,7 @@ export class Room {
       out: p.out,
       connected: p.connected,
       bot: p.bot,
+      ping: p.bot || !p.connected ? -1 : (this.pings.get(p.pid) ?? -1),
     };
   }
 
@@ -240,6 +260,7 @@ export class Room {
     if (!p) return;
     p.connected = false;
     p.goneAt = now;
+    this.pings.delete(pid);
     if (quit || (this.inMatch && p.seat < 0)) this.drop(p);
     this.ensureHost();
     if (this.wipeIfEmpty()) return;
@@ -288,11 +309,30 @@ export class Room {
     return times.length ? Math.min(...times) : null;
   }
 
-  input(pid: string, x: number, y: number): void {
+  /** Queues pointer samples, flattened oldest first as [x0, y0, x1, y1, ...]. tick() applies one per step. */
+  input(pid: string, q: unknown): void {
     const p = this.find(pid);
     if (!this.world || !p || p.seat < 0 || p.out) return;
-    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
-    setTarget(this.world, p.seat, { x: Math.max(-2, Math.min(2, x)), y: Math.max(-2, Math.min(2, y)) });
+    if (!Array.isArray(q) || q.length % 2 !== 0 || q.length > MAX_SAMPLES * 2 || !q.every(Number.isFinite)) return;
+    const queue = this.inputs.get(pid) ?? [];
+    const clamp = (n: number) => Math.max(-2, Math.min(2, n));
+    for (let i = 0; i < q.length; i += 2) queue.push({ x: clamp(q[i] as number), y: clamp(q[i + 1] as number) });
+    this.inputs.set(pid, queue.slice(-INPUT_QUEUE));
+  }
+
+  /**
+   * Stores a player's ping and tells the room when it is new or has moved enough to matter.
+   * Returns the ping now shown for them, or null when the report is ignored.
+   */
+  reportPing(pid: string, ms: unknown): number | null {
+    const p = this.find(pid);
+    if (!p || p.bot || typeof ms !== 'number' || !Number.isFinite(ms)) return null;
+    const ping = Math.round(Math.max(0, Math.min(MAX_PING_MS, ms)));
+    const shown = this.pings.get(pid);
+    if (shown !== undefined && Math.abs(ping - shown) < Math.max(20, shown * 0.2)) return shown;
+    this.pings.set(pid, ping);
+    this.broadcastRoom();
+    return ping;
   }
 
   updateSettings(pid: string, partial: unknown): void {
@@ -323,6 +363,8 @@ export class Room {
     }
     this.winner = null;
     this.lastConceded = -1;
+    this.inputs.clear();
+    this.spots.clear();
     this.phase = 'countdown';
     this.timer = COUNTDOWN_TICKS;
     this.broadcastRoom();
@@ -349,6 +391,7 @@ export class Room {
     this.purge(now);
     if (!this.inMatch) return;
     this.driveBots(world);
+    this.drivePeople(world);
 
     if (this.phase === 'countdown' || this.phase === 'scored') {
       this.timer--;
@@ -362,14 +405,30 @@ export class Room {
     for (const e of step(world, 1 / TICK_HZ)) {
       if (e.k === 'goal') {
         if (this.phase === 'playing') this.goal(e.seat, e.x, e.y);
-      } else if (e.k === 'hit') {
-        this.pending.push([0, round(e.x), round(e.y), round(e.s), e.seat]);
       } else {
-        this.pending.push([1, round(e.x), round(e.y), round(e.s), -1]);
+        const seat = e.k === 'hit' ? e.seat : -1;
+        if (this.quiet(seat, e.x, e.y, e.k === 'hit')) continue;
+        this.pending.push([e.k === 'hit' ? 0 : 1, round(e.x), round(e.y), round(e.s), seat]);
       }
     }
 
     if (this.inMatch && this.tickCount % SNAP_EVERY === 0) this.broadcastSnap();
+  }
+
+  /** True for an event clients shouldn't get: a repeat of a held contact, or a hit too soon after the seat's last one. */
+  private quiet(seat: number, x: number, y: number, hit: boolean): boolean {
+    const spots = (this.spots.get(seat) ?? []).filter((p) => this.tickCount - p.k < SAME_SPOT_TICKS);
+    this.spots.set(seat, spots);
+    const same = spots.find((p) => Math.hypot(x - p.x, y - p.y) < SAME_SPOT);
+    if (same) {
+      same.k = this.tickCount;
+      return true;
+    }
+    const last = spots.at(-1);
+    if (hit && last && this.tickCount - last.k < HIT_EVENT_GAP) return true;
+    spots.push({ k: this.tickCount, x, y });
+    if (spots.length > SPOTS_KEPT) spots.shift();
+    return false;
   }
 
   private driveBots(world: World): void {
@@ -379,6 +438,15 @@ export class Room {
       if (!brain) this.brains.set(p.pid, (brain = newBrain()));
       const target = botTarget(world, p.seat, p.bot, brain, this.io.random, 1 / TICK_HZ);
       if (target) setTarget(world, p.seat, target);
+    }
+  }
+
+  /** Moves each person's mallet to their next queued sample. With nothing queued it holds its last target. */
+  private drivePeople(world: World): void {
+    for (const p of this.players) {
+      if (p.bot || p.seat < 0 || p.out) continue;
+      const next = this.inputs.get(p.pid)?.shift();
+      if (next) setTarget(world, p.seat, next);
     }
   }
 

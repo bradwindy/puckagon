@@ -1,10 +1,16 @@
 import type { Settings } from './settings';
 
 /** Bump when client and server messages change shape, so stale tabs are told to reload. */
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 export const TICK_HZ = 60;
-export const SNAP_EVERY = 2;
+export const SNAP_EVERY = 1;
 export const INPUT_HZ = 30;
+/** Clients sample the pointer once per tick and send the samples in batches at INPUT_HZ, so the server can move the mallet every tick. */
+export const SAMPLE_HZ = TICK_HZ;
+/** The most samples one input message may carry. */
+export const MAX_SAMPLES = 4;
+/** How often clients time a 'ping' against the server's automatic 'pong'. */
+export const PING_MS = 2000;
 /** During a match clients send at least this often, which keeps the room's CPU budget topped up. */
 export const INPUT_HEARTBEAT_MS = 250;
 export const COUNTDOWN_MS = 3000;
@@ -74,6 +80,8 @@ export interface PublicPlayer {
   connected: boolean;
   /** Difficulty for computer players, null for people. */
   bot: BotLevel | null;
+  /** Round-trip time to the server in ms as the player last reported it, or -1 when unknown. */
+  ping: number;
 }
 
 export type GoalKind = 'score' | 'own' | 'none' | 'life';
@@ -126,7 +134,9 @@ export type ServerMsg =
 
 export type ClientMsg =
   | { t: 'hello'; pid: string; name: string }
-  | { t: 'p'; x: number; y: number }
+  /** Pointer samples in table units, oldest first, flattened as [x0, y0, x1, y1, ...]. */
+  | { t: 'p'; q: number[] }
+  | { t: 'rtt'; ms: number }
   | { t: 'settings'; s: Partial<Settings> }
   | { t: 'start' }
   | { t: 'again' }

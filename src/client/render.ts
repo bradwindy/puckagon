@@ -3,6 +3,7 @@ import { PALETTE, type Phase, type PublicPlayer } from '../shared/protocol';
 import type { Settings } from '../shared/settings';
 import { rotate, type Vec } from '../shared/vec';
 import type { Fx } from './fx';
+import { SLOW_MS } from './ping';
 
 const SAMPLES = 180;
 const MORPH_S = 0.7;
@@ -10,6 +11,7 @@ const LABEL_GAP = 0.06;
 const LABEL_PAD_X = 0.34;
 const LABEL_PAD_Y = 0.16;
 const TRAIL_S = 0.32;
+const LAG_COLOR = '#ff4d6a';
 
 export interface Frame {
   layout: Layout;
@@ -590,13 +592,31 @@ export class Renderer {
       if (f.phase !== 'lobby') {
         text = f.settings.mode === 'lives' ? `${p.name}  ${p.out ? 'OUT' : `♥${p.lives}`}` : `${p.name}  ${p.score}`;
       }
-      ctx.font = `700 ${size}px "Chakra Petch", system-ui, sans-serif`;
+      const font = `700 ${size}px "Chakra Petch", system-ui, sans-serif`;
+      ctx.font = font;
       ctx.shadowColor = color;
       ctx.shadowBlur = 10;
       ctx.fillStyle = p.out ? 'rgba(160,170,200,0.5)' : color;
       ctx.globalAlpha = p.connected ? 1 : 0.5;
       const room = ctx.textAlign === 'left' ? this.width - s.x - 6 : ctx.textAlign === 'right' ? s.x - 6 : Math.min(s.x, this.width - s.x) * 2 - 12;
-      ctx.fillText(text, s.x, s.y, Math.max(40, room));
+      const maxW = Math.max(40, room);
+      if (p.connected && p.ping >= SLOW_MS) {
+        const lagFont = `700 ${Math.round(size * 0.7)}px "Chakra Petch", system-ui, sans-serif`;
+        const gap = size * 0.35;
+        ctx.font = lagFont;
+        const lagW = ctx.measureText('LAG').width;
+        ctx.font = font;
+        const nameW = Math.min(ctx.measureText(text).width, Math.max(20, maxW - gap - lagW));
+        const w = nameW + gap + lagW;
+        const x = ctx.textAlign === 'left' ? s.x : ctx.textAlign === 'right' ? s.x - w : s.x - w / 2;
+        ctx.textAlign = 'left';
+        ctx.fillText(text, x, s.y, nameW);
+        ctx.font = lagFont;
+        ctx.fillStyle = ctx.shadowColor = LAG_COLOR;
+        ctx.fillText('LAG', x + nameW + gap, s.y);
+      } else {
+        ctx.fillText(text, s.x, s.y, maxW);
+      }
       ctx.globalAlpha = 1;
     }
     ctx.restore();

@@ -2,6 +2,7 @@ import { MAX_SEATS, MIN_SEATS } from '../shared/geometry';
 import { CODE_LENGTH, NAME_MAX, PALETTE, type BotLevel, type PublicPlayer } from '../shared/protocol';
 import { TARGET_MAX, TARGET_MIN, type Settings } from '../shared/settings';
 import type { NetStatus } from './net';
+import { pingLevel } from './ping';
 import type { GameState } from './state';
 
 type Child = Node | string | null | undefined | false;
@@ -67,6 +68,12 @@ const SIZE: Option<Settings['goal']>[] = [
   { value: 'L', label: 'L' },
 ];
 
+function showPing(tag: HTMLElement, p: PublicPlayer): void {
+  const known = !p.bot && p.connected && p.ping >= 0;
+  tag.className = known ? `ping-tag ping-${pingLevel(p.ping)}` : 'ping-tag hidden';
+  tag.textContent = known ? `${p.ping} ms` : '';
+}
+
 /** Wide screens and landscape phones put the lobby beside the table instead of under it. Matches style.css. */
 const sidePanel = () => window.matchMedia('(min-width: 820px), (orientation: landscape) and (min-width: 640px)').matches;
 
@@ -75,8 +82,12 @@ export class UI {
   private bar: HTMLElement | null = null;
   private panel: HTMLElement | null = null;
   private toast: HTMLElement | null = null;
+  private ping: HTMLElement | null = null;
+  private pingKey = '';
   private code = '';
   private lastPanelKey = '';
+  /** Lobby ping tags by player id, updated in place so a ping change never rebuilds the panel under a tap. */
+  private pingTags = new Map<string, HTMLElement>();
 
   constructor(
     private root: HTMLElement,
@@ -88,8 +99,8 @@ export class UI {
 
   private clear(): void {
     this.root.replaceChildren();
-    this.screen = this.bar = this.panel = this.toast = null;
-    this.lastPanelKey = '';
+    this.screen = this.bar = this.panel = this.toast = this.ping = null;
+    this.lastPanelKey = this.pingKey = '';
   }
 
   private nameInput(name: string): HTMLInputElement {
@@ -207,12 +218,13 @@ export class UI {
       this.muted = this.on.mute();
       muteBtn.textContent = this.muted ? 'Sound off' : 'Sound on';
     });
+    this.ping = h('span', { class: 'ping hidden' });
     this.bar = h(
       'header',
       { class: 'bar' },
       h('a', { class: 'logo tiny', href: '/', onclick: (e: Event) => (e.preventDefault(), this.on.leave()) }, 'PUCK', h('span', {}, 'AGON')),
-      h('button', { class: 'chip', title: 'Copy invite link', onclick: () => this.copyLink() }, `Party ${code}`),
-      h('div', { class: 'spacer' }),
+      h('button', { class: 'chip', title: 'Copy invite link', onclick: () => this.copyLink() }, h('span', { class: 'chip-label' }, 'Party '), code),
+      this.ping,
       muteBtn,
       h('button', { class: 'btn icon', onclick: () => this.on.leave() }, 'Leave'),
     );
@@ -245,6 +257,16 @@ export class UI {
     this.toast.classList.remove('hidden');
     clearTimeout((this.toast as unknown as { t?: number }).t);
     (this.toast as unknown as { t?: number }).t = window.setTimeout(() => this.toast?.classList.add('hidden'), ms);
+  }
+
+  /** Shows your ping in the top bar, or hides it while unknown. */
+  setPing(ms: number, unstable: boolean): void {
+    const key = `${ms}:${unstable}`;
+    if (!this.ping || key === this.pingKey) return;
+    this.pingKey = key;
+    this.ping.className = unstable ? 'ping ping-bad unstable' : ms < 0 ? 'ping hidden' : `ping ping-${pingLevel(ms)}`;
+    this.ping.textContent = unstable ? 'unstable' : `${ms} ms`;
+    this.ping.title = unstable ? 'The game is arriving unevenly, so the puck may stutter' : 'Your ping to the party';
   }
 
   /** Area of the window the table should fit in, given what overlays are showing. */
@@ -289,10 +311,18 @@ export class UI {
 
     const room = state.room;
     if (!room) return;
-    const key = JSON.stringify([room.phase, room.host, room.settings, room.players, room.winner, state.myId]);
-    if (key === this.lastPanelKey) return;
+    const players = room.players.map((p) => ({ ...p, ping: 0 }));
+    const key = JSON.stringify([room.phase, room.host, room.settings, players, room.winner, state.myId]);
+    if (key === this.lastPanelKey) {
+      for (const p of room.players) {
+        const tag = this.pingTags.get(p.id);
+        if (tag) showPing(tag, p);
+      }
+      return;
+    }
     this.lastPanelKey = key;
 
+    this.pingTags.clear();
     if (room.phase === 'lobby') this.renderLobby(state);
     else if (room.phase === 'over') this.renderOver(state);
     else this.renderPlaying(state);
@@ -306,12 +336,16 @@ export class UI {
     if (p.id === state.myId) tags.push('you');
     if (p.seat < 0) tags.push('watching');
     if (!p.connected) tags.push('away');
+    const ping = h('span');
+    showPing(ping, p);
+    this.pingTags.set(p.id, ping);
     return h(
       'li',
       { class: `player${p.connected ? '' : ' away'}` },
       h('span', { class: 'dot', style: { '--c': PALETTE[p.color] } }),
       h('span', { class: 'name' }, p.name),
       h('span', { class: 'tags' }, tags.join(' · ')),
+      ping,
       removable &&
         h('button', { class: 'remove', title: `Remove ${p.name}`, 'aria-label': `Remove ${p.name}`, onclick: () => this.on.removeBot(p.id) }, '×'),
     );

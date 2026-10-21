@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { COUNTDOWN_MS, LOBBY_GRACE_MS, RECONNECT_GRACE_MS, TICK_HZ, type RoomMsg, type ServerMsg } from '../src/shared/protocol';
+import {
+  COUNTDOWN_MS,
+  LOBBY_GRACE_MS,
+  RECONNECT_GRACE_MS,
+  TICK_HZ,
+  type RoomMsg,
+  type ServerMsg,
+  type SnapMsg,
+} from '../src/shared/protocol';
 import { resolveGoal } from '../src/shared/rules';
 import { Room } from '../src/worker/room';
 
@@ -246,6 +254,122 @@ describe('Room match', () => {
     room.again('pid-0');
     expect(lastRoom()).toMatchObject({ phase: 'lobby', winner: null });
     expect(lastRoom().players.map((p) => p.score)).toEqual([0, 0]);
+  });
+});
+
+describe('Room input', () => {
+  /** Points on a line from seat 0's mallet towards the centre, `step` apart. */
+  const sweep = (room: Room, step: number) => {
+    const { x, y } = room.world!.mallets[0]!;
+    const d = Math.hypot(x, y);
+    return (i: number) => [x - (x / d) * step * i, y - (y / d) * step * i];
+  };
+  const mallet = (room: Room) => room.world!.mallets[0]!;
+
+  it('moves the mallet the same distance every tick when samples arrive two at a time', () => {
+    const { room, tick } = startMatch(['Ann', 'Ben']);
+    const at = sweep(room, 0.01);
+    const moved: number[] = [];
+    for (let i = 1; i < 20; i += 2) {
+      room.input('pid-0', [...at(i), ...at(i + 1)]);
+      for (let j = 0; j < 2; j++) {
+        const { x, y } = mallet(room);
+        tick();
+        moved.push(Math.round(Math.hypot(mallet(room).x - x, mallet(room).y - y) * 1000) / 1000);
+      }
+    }
+    expect(moved).toEqual(moved.map(() => 0.01));
+  });
+
+  it('keeps only the newest four samples, holds the last one, and ignores malformed input', () => {
+    const { room, tick } = startMatch(['Ann', 'Ben']);
+    const at = sweep(room, 0.05);
+    const target = () => [mallet(room).tx, mallet(room).ty];
+    room.input('pid-0', [...at(1), ...at(2)]);
+    room.input('pid-0', [...at(3), ...at(4), ...at(5)]);
+    tick();
+    expect(target()).toEqual(at(2));
+    for (let i = 0; i < 4; i++) tick();
+    expect(target()).toEqual(at(5));
+    for (const bad of [[at(1)[0]], [...at(1), ...at(2), ...at(3), ...at(4), ...at(6)], [at(1)[0], NaN], [at(1)[0], '0.1'], 'x']) {
+      room.input('pid-0', bad);
+      tick();
+      expect(target()).toEqual(at(5));
+    }
+  });
+});
+
+describe('Room pings', () => {
+  it('shows pings to everyone, keeps them out of storage, and only rebroadcasts real changes', () => {
+    const { room, sent, lastRoom, clock } = makeRoom();
+    room.join('pid-a', 'Ann');
+    room.join('pid-b', 'Ben');
+    room.addBot('pid-a', 'easy');
+    const broadcasts = () => sent.filter((m) => m.t === 'room').length;
+    const pings = () => lastRoom().players.map((p) => p.ping);
+
+    const before = broadcasts();
+    room.reportPing('pid-b', 100.4);
+    expect(pings()).toEqual([-1, 100, -1]);
+    room.reportPing('pid-b', 119);
+    room.reportPing('pid-b', 120);
+    room.reportPing('pid-b', 143);
+    room.reportPing('pid-b', 144);
+    expect(broadcasts()).toBe(before + 3);
+    expect(pings()).toEqual([-1, 144, -1]);
+    expect(room.snapshot().players[1]).not.toHaveProperty('ping');
+
+    room.leave('pid-b', clock.now);
+    room.join('pid-b', 'Ben');
+    expect(pings()).toEqual([-1, -1, -1]);
+  });
+});
+
+describe('Room hit events', () => {
+  it('keeps a held puck quiet after its first contact, and sends at most one hit per seat every four ticks', () => {
+    const { room, sent, tick } = startMatch(['Ann', 'Ben']);
+    const w = room.world!;
+    const events = (kind: 0 | 1, from: number) =>
+      sent
+        .slice(from)
+        .filter((m): m is SnapMsg => m.t === 's')
+        .flatMap((m) => m.e.filter((e) => e[0] === kind).map((e) => e[4]));
+    /** Puts the puck against a seat's mallet, `angle` radians round from the side facing the centre, moving into it. */
+    const strike = (seat: number, angle: number) => {
+      const m = w.mallets[seat]!;
+      const toCentre = Math.atan2(-m.y, -m.x) + angle;
+      const [nx, ny] = [Math.cos(toCentre), Math.sin(toCentre)];
+      const gap = w.layout.puckR + w.layout.malletR + 0.01;
+      w.puck = { x: m.x + nx * gap, y: m.y + ny * gap, vx: -nx * 3, vy: -ny * 3 };
+    };
+
+    let from = sent.length;
+    for (let i = 0; i < 16; i++) {
+      strike(i % 2, 0);
+      tick();
+    }
+    expect(events(0, from)).toEqual([0, 1]);
+
+    w.puck = { x: 0, y: 0, vx: 0, vy: 0 };
+    for (let i = 0; i < 30; i++) tick();
+    from = sent.length;
+    for (let i = 0; i < 16; i++) {
+      strike(i % 2, ((i >> 1) - 3.5) * 0.4);
+      tick();
+    }
+    const hits = events(0, from);
+    expect(hits.filter((seat) => seat === 0)).toHaveLength(4);
+    expect(hits.filter((seat) => seat === 1)).toHaveLength(4);
+
+    from = sent.length;
+    const wall = w.layout.sides.find((s) => s.owner < 0)!;
+    for (let i = 0; i < 16; i++) {
+      const { mid, normal } = wall;
+      const gap = w.layout.puckR + 0.01;
+      w.puck = { x: mid.x + normal.x * gap, y: mid.y + normal.y * gap, vx: -normal.x * 3, vy: -normal.y * 3 };
+      tick();
+    }
+    expect(events(1, from)).toHaveLength(1);
   });
 });
 

@@ -270,6 +270,53 @@ input {
   cursor: pointer;
 }
 
+.ping-good {
+  --c: #4be37a;
+}
+
+.ping-fair {
+  --c: #ffc53d;
+}
+
+.ping-bad {
+  --c: #ff4d6a;
+}
+
+.ping {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: rgba(10, 14, 38, 0.7);
+  font-size: 13px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.ping::before {
+  content: '';
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--c);
+  box-shadow: 0 0 8px var(--c);
+}
+
+.ping.unstable,
+.ping-tag {
+  color: var(--c);
+}
+
+.ping-tag {
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 /* Party */
 
 .bar {
@@ -288,9 +335,9 @@ input {
   pointer-events: auto;
 }
 
-.spacer {
-  flex: 1;
-  pointer-events: none !important;
+/* Pushes the rest of the bar to the right. */
+.bar .chip {
+  margin-right: auto;
 }
 
 .panel {
@@ -577,5 +624,25 @@ input {
 
   .bar .logo.tiny {
     display: none;
+  }
+}
+
+@media (max-width: 420px) {
+  .bar {
+    gap: 6px;
+  }
+
+  .bar .btn.icon {
+    padding: 8px 10px;
+  }
+
+  .chip-label {
+    display: none;
+  }
+
+  .ping {
+    gap: 5px;
+    padding: 5px 8px;
+    font-size: 12px;
   }
 }

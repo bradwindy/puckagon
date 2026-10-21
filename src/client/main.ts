@@ -3,23 +3,14 @@ import '@fontsource/chakra-petch/700.css';
 import './style.css';
 import { clampToConvex, homePosition, makeLayout, MAX_SEATS, MIN_SEATS, zoneFor } from '../shared/geometry';
 import { createWorld, serve, step, type World } from '../shared/physics';
-import {
-  CODE_ALPHABET,
-  CODE_LENGTH,
-  INPUT_HEARTBEAT_MS,
-  INPUT_HZ,
-  normalizeCode,
-  PALETTE,
-  round,
-  sanitizeName,
-  type Phase,
-  type ServerMsg,
-} from '../shared/protocol';
+import { CODE_ALPHABET, CODE_LENGTH, normalizeCode, PALETTE, sanitizeName, type Phase, type ServerMsg } from '../shared/protocol';
 import { DEFAULT_SETTINGS } from '../shared/settings';
 import type { Vec } from '../shared/vec';
 import { Sfx } from './audio';
 import { Fx } from './fx';
+import { InputSampler } from './input';
 import { Net, type NetStatus } from './net';
+import { SLOW_MS, UNSTABLE_RATE } from './ping';
 import { Renderer, type Frame } from './render';
 import { GameState, type Due } from './state';
 import { UI } from './ui';
@@ -27,6 +18,10 @@ import { UI } from './ui';
 const NAME_KEY = 'puckagon:name';
 const PID_KEY = 'puckagon:pid';
 const MATCH: Phase[] = ['countdown', 'playing', 'scored'];
+/** Playback stays marked unstable this long after its last late frame, so stutters a second apart count as one spell. */
+const UNSTABLE_HOLD_MS = 2000;
+/** How long the connection must stay slow or unstable before we say so. */
+const WARN_AFTER_MS = 3000;
 
 function storageGet(store: () => Storage, key: string): string {
   try {
@@ -122,8 +117,10 @@ class PartySession {
   status: NetStatus = 'connecting';
   pointer: Vec | null = null;
   private myMallet: Vec | null = null;
-  private lastSent = 0;
-  private sentKey = '';
+  private input = new InputSampler();
+  private unstableUntil = 0;
+  private badSince = Infinity;
+  private warned = false;
   private roomAt = 0;
   private lastCount = 0;
   private celebrateTimer = 0;
@@ -263,18 +260,17 @@ class PartySession {
     const inMatch = MATCH.includes(room.phase);
     // Players who haven't touched the table yet still send heartbeats, from where the server parked their mallet.
     if (inMatch && active >= 0 && !this.myMallet) this.myMallet = homePosition(layout, active, room.settings.zone);
-    // 2 ms of slack so 60 Hz frames (33.3 ms apart) don't fall just short and halve the send rate.
-    if (inMatch && active >= 0 && this.myMallet && now - this.lastSent >= 1000 / INPUT_HZ - 2) {
-      const x = round(this.myMallet.x);
-      const y = round(this.myMallet.y);
-      const key = `${x},${y}`;
-      if (key !== this.sentKey || now - this.lastSent >= INPUT_HEARTBEAT_MS) {
-        this.net.send({ t: 'p', x, y });
-        this.sentKey = key;
-        this.lastSent = now;
-      }
+    if (inMatch && active >= 0 && this.myMallet) {
+      const q = this.input.sample(now, this.myMallet);
+      if (q) this.net.send({ t: 'p', q });
     }
     document.body.classList.toggle('aiming', active >= 0);
+
+    const live = this.status === 'open' && inMatch;
+    if (live && st.lateRate > UNSTABLE_RATE) this.unstableUntil = now + UNSTABLE_HOLD_MS;
+    const unstable = live && now < this.unstableUntil;
+    ui.setPing(this.net.rtt, unstable);
+    this.watchConnection(now, this.net.rtt, unstable);
 
     const countdown = room.phase === 'countdown' ? Math.max(0, room.timer - (now - this.roomAt)) : 0;
     const count = Math.ceil(countdown / 1000);
@@ -297,6 +293,14 @@ class PartySession {
       countdown,
       fit,
     };
+  }
+
+  private watchConnection(now: number, rtt: number, unstable: boolean): void {
+    const slow = rtt >= SLOW_MS;
+    this.badSince = slow || unstable ? Math.min(this.badSince, now) : Infinity;
+    if (this.warned || now - this.badSince < WARN_AFTER_MS) return;
+    this.warned = true;
+    ui.flash(slow ? `Slow connection (${rtt} ms). A VPN can add lag.` : 'Unstable connection. The puck may stutter.', 5000);
   }
 }
 

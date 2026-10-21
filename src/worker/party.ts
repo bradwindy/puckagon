@@ -4,18 +4,23 @@ import { MAX_PLAYERS, Room, type RoomSnapshot } from './room';
 
 interface Attachment {
   pid: string;
+  /** The ping the room last showed for this player, kept here so it survives hibernation without a storage write. */
+  ping?: number;
 }
 
 const PID_RE = /^[A-Za-z0-9_-]{16,64}$/;
 const MAX_MESSAGES_PER_SECOND = 90;
 const SNAPSHOT_KEY = 'room';
 const STALL_MS = 1000;
+const MAX_CATCH_UP = 4;
 
 /** One Durable Object per party code. Uses the WebSocket Hibernation API so an idle lobby costs nothing. */
 export class Party extends DurableObject<Env> {
   private room: Room;
   private sockets = new Map<string, WebSocket>();
-  private loop: ReturnType<typeof setInterval> | null = null;
+  private loop: ReturnType<typeof setTimeout> | null = null;
+  private loopStart = 0;
+  private ticksRun = 0;
   private purgeTimer: ReturnType<typeof setTimeout> | null = null;
   private lastTickAt = 0;
   private budget = new WeakMap<WebSocket, { second: number; count: number }>();
@@ -34,13 +39,16 @@ export class Party extends DurableObject<Env> {
     });
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'));
 
+    const pings = new Map<string, number>();
     for (const ws of ctx.getWebSockets()) {
       const att = ws.deserializeAttachment() as Attachment | null;
-      if (att?.pid && ws.readyState === WebSocket.OPEN) this.sockets.set(att.pid, ws);
+      if (!att?.pid || ws.readyState !== WebSocket.OPEN) continue;
+      this.sockets.set(att.pid, ws);
+      if (att.ping !== undefined) pings.set(att.pid, att.ping);
     }
     const snap = ctx.storage.kv.get<RoomSnapshot>(SNAPSHOT_KEY);
     if (snap) {
-      this.room.restore(snap, new Set(this.sockets.keys()), Date.now());
+      this.room.restore(snap, new Set(this.sockets.keys()), Date.now(), pings);
       this.schedulePurge();
     }
   }
@@ -84,8 +92,13 @@ export class Party extends DurableObject<Env> {
 
     switch (msg.t) {
       case 'p':
-        this.room.input(pid, Number(msg.x), Number(msg.y));
+        this.room.input(pid, msg.q);
         return;
+      case 'rtt': {
+        const ping = this.room.reportPing(pid, msg.ms);
+        if (ping !== null) ws.serializeAttachment({ pid, ping } satisfies Attachment);
+        return;
+      }
       case 'settings':
         this.room.updateSettings(pid, msg.s);
         break;
@@ -183,23 +196,45 @@ export class Party extends DurableObject<Env> {
 
   private startLoop(): void {
     if (this.loop) return;
-    this.lastTickAt = Date.now();
-    this.loop = setInterval(() => {
-      this.lastTickAt = Date.now();
-      this.room.tick(this.lastTickAt);
-      if (!this.room.inMatch) {
-        this.afterChange().catch((err) => console.error(JSON.stringify({ event: 'match_end_failed', error: String(err) })));
+    this.lastTickAt = this.loopStart = Date.now();
+    this.ticksRun = 0;
+    this.scheduleTicks();
+  }
+
+  /** Aims each timer at the next tick boundary, so ticks follow the wall clock however the runtime rounds delays. */
+  private scheduleTicks(): void {
+    const next = this.loopStart + ((this.ticksRun + 1) * 1000) / TICK_HZ;
+    this.loop = setTimeout(() => this.runTicks(), Math.max(0, Math.ceil(next - Date.now())));
+  }
+
+  private runTicks(): void {
+    const now = Date.now();
+    this.lastTickAt = now;
+    const due = Math.floor(((now - this.loopStart) * TICK_HZ) / 1000);
+    this.ticksRun = Math.max(this.ticksRun, due - MAX_CATCH_UP);
+    try {
+      while (this.ticksRun < due && this.room.inMatch) {
+        this.ticksRun++;
+        this.room.tick(now);
       }
-    }, 1000 / TICK_HZ);
+    } catch (err) {
+      console.error(JSON.stringify({ event: 'tick_failed', error: String(err) }));
+    }
+    if (this.room.inMatch) {
+      this.scheduleTicks();
+      return;
+    }
+    this.loop = null;
+    this.afterChange().catch((err) => console.error(JSON.stringify({ event: 'match_end_failed', error: String(err) })));
   }
 
   private stopLoop(): void {
     if (!this.loop) return;
-    clearInterval(this.loop);
+    clearTimeout(this.loop);
     this.loop = null;
   }
 
-  /** The runtime can stop rescheduling an interval that runs out of CPU budget. Restart it if ticks have stalled. */
+  /** The runtime can stop running the tick timer when the object runs out of CPU budget. Restart it if ticks have stalled. */
   private watchdog(): void {
     if (this.loop && this.room.inMatch && Date.now() - this.lastTickAt > STALL_MS) {
       console.warn(JSON.stringify({ event: 'tick_stall_restart', stalledMs: Date.now() - this.lastTickAt }));

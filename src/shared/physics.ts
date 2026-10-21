@@ -9,6 +9,13 @@ const HIT_EVENT_MIN = 0.12;
 const WALL_EVENT_MIN = 0.2;
 const IDLE_SPEED = 0.06;
 const IDLE_NUDGE_AFTER = 3;
+/**
+ * A hard swing can send the puck past the table's top speed for a moment, up to a bit faster than a mallet can move, so
+ * the puck leaves the mallet behind instead of riding it.
+ */
+const SPEED_CEILING = MALLET_MAX_SPEED * 1.05;
+/** How fast, per second, speed above the table's top speed dies away. The further over it is, the faster it goes. */
+const SOFT_CAP_DECAY = 6;
 
 export interface Puck {
   x: number;
@@ -104,6 +111,50 @@ function capSpeed(p: Puck, max: number): void {
   }
 }
 
+function softCap(p: Puck, max: number, dt: number): void {
+  const s = Math.hypot(p.vx, p.vy);
+  if (s <= max) return;
+  const k = (max + (s - max) * Math.exp(-SOFT_CAP_DECAY * (s / max) * dt)) / s;
+  p.vx *= k;
+  p.vy *= k;
+}
+
+/**
+ * Pushes overlapping mallets apart along the line between them, half each, keeping each inside its zone. When a zone
+ * edge holds one back, or several crowd into one spot, the next round moves them apart further.
+ */
+function separateMallets(world: World): void {
+  const { layout, mallets } = world;
+  const minD = 2 * layout.malletR;
+  for (let round = 0; round < 8; round++) {
+    let moved = false;
+    for (let a = 0; a < mallets.length; a++) {
+      for (let b = a + 1; b < mallets.length; b++) {
+        const ma = mallets[a];
+        const mb = mallets[b];
+        if (!ma || !mb) continue;
+        let dx = mb.x - ma.x;
+        let dy = mb.y - ma.y;
+        const dist = Math.hypot(dx, dy);
+        if (dist >= minD - 1e-3) continue;
+        if (dist < 1e-9) {
+          dx = Math.cos(layout.facing[b]) - Math.cos(layout.facing[a]);
+          dy = Math.sin(layout.facing[b]) - Math.sin(layout.facing[a]);
+        }
+        const push = (minD - dist) / 2 / Math.hypot(dx, dy);
+        const pa = clampToConvex({ x: ma.x - dx * push, y: ma.y - dy * push }, zoneFor(layout, a, world.zone));
+        const pb = clampToConvex({ x: mb.x + dx * push, y: mb.y + dy * push }, zoneFor(layout, b, world.zone));
+        if (Math.hypot(pa.x - ma.x, pa.y - ma.y) + Math.hypot(pb.x - mb.x, pb.y - mb.y) > 1e-4) moved = true;
+        ma.x = pa.x;
+        ma.y = pa.y;
+        mb.x = pb.x;
+        mb.y = pb.y;
+      }
+    }
+    if (!moved) return;
+  }
+}
+
 function bounce(p: Puck, nx: number, ny: number, e: number): number {
   const vn = p.vx * nx + p.vy * ny;
   if (vn >= 0) return 0;
@@ -129,7 +180,7 @@ export function step(world: World, dt: number): SimEvent[] {
       dx *= maxMove / d;
       dy *= maxMove / d;
     }
-    return { sx: m.x, sy: m.y, dx, dy, vx: dx / dt, vy: dy / dt };
+    return { dx, dy, vx: dx / dt, vy: dy / dt };
   });
 
   const longest = Math.max(Math.hypot(puck.vx, puck.vy) * dt, ...moves.map((mv) => (mv ? Math.hypot(mv.dx, mv.dy) : 0)));
@@ -138,14 +189,20 @@ export function step(world: World, dt: number): SimEvent[] {
   const posts = world.open.map((open, seat) => (open ? goalPosts(layout, seat) : null));
 
   for (let i = 1; i <= substeps; i++) {
-    const f = i / substeps;
     for (let seat = 0; seat < moves.length; seat++) {
       const mv = moves[seat];
       const m = world.mallets[seat];
       if (!mv || !m) continue;
-      m.x = mv.sx + mv.dx * f;
-      m.y = mv.sy + mv.dy * f;
+      m.x += mv.dx / substeps;
+      m.y += mv.dy / substeps;
+      if (world.zone === 'wedge') {
+        // A mallet pushed aside by a neighbour carries on from where it was pushed, so keep it in its zone.
+        const c = clampToConvex(m, zoneFor(layout, seat, world.zone));
+        m.x = c.x;
+        m.y = c.y;
+      }
     }
+    if (world.zone === 'wedge') separateMallets(world);
     if (world.frozen) continue;
 
     puck.x += puck.vx * h;
@@ -216,10 +273,48 @@ export function step(world: World, dt: number): SimEvent[] {
       }
     }
 
-    capSpeed(puck, world.speed.max);
+    // A puck held by a wall, a post or another mallet stops a mallet that is still pressing into it, for the rest of
+    // the tick. A mallet that its zone edge keeps from backing off pushes the puck aside instead, which lets a mallet
+    // later in the loop give way.
+    for (let seat = 0; seat < moves.length; seat++) {
+      const mv = moves[seat];
+      const m = world.mallets[seat];
+      if (!mv || !m) continue;
+      const dx = m.x - puck.x;
+      const dy = m.y - puck.y;
+      const dist = Math.hypot(dx, dy);
+      const minD = r + rm;
+      if (dist >= minD - 1e-6 || dist < 1e-9) continue;
+      const c = clampToConvex(
+        { x: puck.x + (dx / dist) * minD, y: puck.y + (dy / dist) * minD },
+        zoneFor(layout, seat, world.zone),
+      );
+      m.x = c.x;
+      m.y = c.y;
+      mv.dx = mv.dy = mv.vx = mv.vy = 0;
+      const ex = puck.x - m.x;
+      const ey = puck.y - m.y;
+      const left = Math.hypot(ex, ey);
+      if (left < 1e-9) continue;
+      const nx = ex / left;
+      const ny = ey / left;
+      if (left < minD - 1e-6) {
+        puck.x = m.x + nx * minD;
+        puck.y = m.y + ny * minD;
+      }
+      // Drop the puck's speed into the stopped mallet, or it bounces between the mallet and its holder every substep.
+      const vn = puck.vx * nx + puck.vy * ny;
+      if (vn < 0) {
+        puck.vx -= vn * nx;
+        puck.vy -= vn * ny;
+      }
+    }
+
+    capSpeed(puck, SPEED_CEILING);
   }
 
   if (!world.frozen) {
+    softCap(puck, world.speed.max, dt);
     const decay = Math.exp(-world.speed.friction * dt);
     puck.vx *= decay;
     puck.vy *= decay;

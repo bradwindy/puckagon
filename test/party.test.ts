@@ -97,7 +97,7 @@ describe('Party Durable Object', () => {
     await guest.until(isRoom((m) => m.phase === 'playing'), 6000);
 
     guest.messages.length = 0;
-    guest.send({ t: 'p', x: 0.3, y: -0.6 });
+    guest.send({ t: 'p', q: [0.3, -0.6] });
     const moved = await guest.until((m): m is SnapMsg => isSnap(m) && Array.isArray(m.m[1]) && Math.abs(m.m[1][0] - 0.3) < 0.01);
     expect(moved.m[1]).toEqual([expect.closeTo(0.3, 2), expect.closeTo(-0.6, 2)]);
 
@@ -139,6 +139,50 @@ describe('Party Durable Object', () => {
     expect(again.id).toBe(first.id);
     host.ws.close(CLOSE.left);
     back.ws.close(CLOSE.left);
+  });
+
+  // Without the wall-clock lock, setInterval(1000 / 60) ticks at 62.5 Hz in production and at 52 to 56 Hz in local workerd.
+  it('ticks 60 times a second of real time', async () => {
+    const host = await connect('TKR6Q');
+    host.send({ t: 'hello', pid: 'tick-rate-host-token', name: 'Host' });
+    await host.until(isRoom((m) => m.players.length === 1));
+    host.send({ t: 'addBot', level: 'easy' });
+    await host.until(isRoom((m) => m.players.length === 2));
+
+    const snaps: { k: number; at: number }[] = [];
+    host.ws.addEventListener('message', (e) => {
+      const m = JSON.parse(e.data as string) as ServerMsg;
+      if (isSnap(m)) snaps.push({ k: m.k, at: Date.now() });
+    });
+    host.send({ t: 'start' });
+    await new Promise((resolve) => setTimeout(resolve, 2500));
+    host.ws.close(CLOSE.left);
+
+    const first = snaps[0];
+    const last = snaps.at(-1)!;
+    const hz = ((last.k - first.k) * 1000) / (last.at - first.at);
+    expect(hz).toBeGreaterThan(59);
+    expect(hz).toBeLessThan(61);
+  }, 10000);
+
+  it("shows everyone a player's reported ping, even after the party went to sleep", async () => {
+    const host = await connect('PNG23');
+    host.send({ t: 'hello', pid: 'ping-host-token-01', name: 'Host' });
+    await host.until(isRoom((m) => m.players.length === 1));
+    const guest = await connect('PNG23');
+    guest.send({ t: 'hello', pid: 'ping-guest-token-1', name: 'Guest' });
+    await host.until(isRoom((m) => m.players.length === 2));
+
+    guest.send({ t: 'rtt', ms: 87 });
+    const seen = await host.until(isRoom((m) => m.players[1]?.ping === 87));
+    expect(seen.players.map((p) => p.ping)).toEqual([-1, 87]);
+
+    await evictDurableObject(env.PARTY.getByName('PNG23'));
+    host.send({ t: 'settings', s: { target: 3 } });
+    const woken = await host.until(isRoom((m) => m.settings.target === 3));
+    expect(woken.players.map((p) => p.ping)).toEqual([-1, 87]);
+    host.ws.close(CLOSE.left);
+    guest.ws.close(CLOSE.left);
   });
 
   it('turns new players away once the party is full', async () => {
