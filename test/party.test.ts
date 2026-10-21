@@ -1,7 +1,16 @@
-import { evictDurableObject } from 'cloudflare:test';
+import { abortAllDurableObjects, evictDurableObject } from 'cloudflare:test';
 import { env, exports } from 'cloudflare:workers';
-import { describe, expect, it } from 'vitest';
-import { CLOSE, PROTOCOL_VERSION, type RoomMsg, type ServerMsg, type SnapMsg } from '../src/shared/protocol';
+import { describe, expect, it, vi } from 'vitest';
+import {
+  CLOSE,
+  HOST_GRACE_MS,
+  LOBBY_GRACE_MS,
+  PROTOCOL_VERSION,
+  type MatchMsg,
+  type RoomMsg,
+  type ServerMsg,
+} from '../src/shared/protocol';
+import { iceServers } from '../src/worker/party';
 import { MAX_PLAYERS } from '../src/worker/room';
 
 interface Client {
@@ -11,6 +20,32 @@ interface Client {
   until<T extends ServerMsg>(match: (m: ServerMsg) => m is T, timeoutMs?: number): Promise<T>;
   send(msg: object): void;
 }
+
+type Welcome = Extract<ServerMsg, { t: 'welcome' }>;
+type Ice = Extract<ServerMsg, { t: 'ice' }>;
+type Signal = Extract<ServerMsg, { t: 'signal' }>;
+
+/** What Cloudflare's TURN API answers, port 53 URLs included. */
+const TURN_SERVERS = [
+  { urls: ['stun:stun.cloudflare.com:3478', 'stun:stun.cloudflare.com:53'] },
+  {
+    urls: ['turn:turn.cloudflare.com:3478?transport=udp', 'turn:turn.cloudflare.com:53?transport=udp', 'turns:turn.cloudflare.com:443?transport=tcp'],
+    username: 'test-user',
+    credential: 'test-credential',
+  },
+  { urls: 'turn:turn.cloudflare.com:53' },
+];
+
+/** Answers a TURN credentials request for the made-up key in vitest.config.ts, and nothing else. */
+function turnApi(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const req = new Request(input, init);
+  const url = 'https://rtc.live.cloudflare.com/v1/turn/keys/test-key-id/credentials/generate-ice-servers';
+  const ok = req.method === 'POST' && req.url === url && req.headers.get('Authorization') === 'Bearer test-key-token';
+  return Promise.resolve(ok ? Response.json({ iceServers: TURN_SERVERS }, { status: 201 }) : new Response('Not found', { status: 404 }));
+}
+
+// The Durable Object runs in this isolate, so this answers its outbound requests too.
+const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(turnApi);
 
 const url = (code: string, v: string | number = PROTOCOL_VERSION) => `https://puckagon.test/api/party/${code}/ws?v=${v}`;
 
@@ -51,11 +86,23 @@ async function connect(code: string, v: string | number = PROTOCOL_VERSION): Pro
   };
 }
 
+/** Connects and says hello, then waits for the party's welcome. */
+async function join(code: string, pid: string, name: string): Promise<Client & { id: string }> {
+  const c = await connect(code);
+  c.send({ t: 'hello', pid, name });
+  const { id } = await c.until(isWelcome);
+  return { ...c, id };
+}
+
 const isRoom =
   (pred: (m: RoomMsg) => boolean = () => true) =>
   (m: ServerMsg): m is RoomMsg =>
     m.t === 'room' && pred(m);
-const isSnap = (m: ServerMsg): m is SnapMsg => m.t === 's';
+const isWelcome = (m: ServerMsg): m is Welcome => m.t === 'welcome';
+const isIce = (m: ServerMsg): m is Ice => m.t === 'ice';
+const isSignal = (m: ServerMsg): m is Signal => m.t === 'signal';
+const seats = (n: number) => Array.from({ length: n }, () => ({ score: 0, lives: 7, out: false, linked: true }));
+const playing = (n: number): MatchMsg => ({ t: 'match', match: 1, v: 1, phase: 'playing', k: 180, timer: 0, seats: seats(n), winner: null });
 
 describe('Worker routing', () => {
   it('rejects bad requests before they reach a Durable Object', async () => {
@@ -73,47 +120,149 @@ describe('Worker routing', () => {
 });
 
 describe('Party Durable Object', () => {
-  it('runs a lobby and a match for two players over real WebSockets', async () => {
-    const host = await connect('HKY23');
-    host.send({ t: 'hello', pid: 'host-player-token-1', name: 'Host' });
-    await host.until(isRoom((m) => m.players.length === 1));
-
-    const guest = await connect('HKY23');
-    guest.send({ t: 'hello', pid: 'guest-player-token-1', name: '  Guest\u0000  ' });
-    const both = await guest.until(isRoom((m) => m.players.length === 2));
-    expect(both.players.map((p) => [p.name, p.seat])).toEqual([
-      ['Host', 0],
-      ['Guest', 1],
+  it('welcomes a page, shows it the room, then gives it TURN servers without port 53', async () => {
+    const c = await connect('TRN23');
+    c.send({ t: 'hello', pid: 'ice-player-token-01', name: 'Ann' });
+    const ice = await c.until(isIce);
+    expect(c.messages.map((m) => m.t)).toEqual(['welcome', 'room', 'ice']);
+    expect(ice.servers).toEqual([
+      { urls: ['stun:stun.cloudflare.com:3478'] },
+      {
+        urls: ['turn:turn.cloudflare.com:3478?transport=udp', 'turns:turn.cloudflare.com:443?transport=tcp'],
+        username: 'test-user',
+        credential: 'test-credential',
+      },
     ]);
-    expect(both.host).toBe(both.players[0].id);
+    c.ws.close(CLOSE.left);
+  });
 
-    guest.send({ t: 'settings', s: { target: 3 } });
-    host.send({ t: 'settings', s: { speed: 'chaos', zone: 'free' } });
-    const changed = await guest.until(isRoom((m) => m.settings.speed === 'chaos'));
-    expect(changed.settings).toMatchObject({ target: 7, zone: 'free' });
+  it('gives every page in a party the TURN servers from one request', async () => {
+    const before = fetchSpy.mock.calls.length;
+    const a = await join('TRN34', 'shared-ice-token-01', 'Ann');
+    const b = await join('TRN34', 'shared-ice-token-02', 'Ben');
+    const [first, second] = await Promise.all([a.until(isIce), b.until(isIce)]);
+    expect(second.servers).toEqual(first.servers);
+    expect(first.servers.some((s) => s.username === 'test-user')).toBe(true);
+    expect(fetchSpy.mock.calls.length - before).toBe(1);
+    a.ws.close(CLOSE.left);
+    b.ws.close(CLOSE.left);
+  });
 
+  it('hands out Cloudflare STUN alone, without a request, when the TURN key is unset', async () => {
+    const before = fetchSpy.mock.calls.length;
+    expect(await iceServers({})).toEqual([{ urls: 'stun:stun.cloudflare.com:3478' }]);
+    expect(fetchSpy.mock.calls.length).toBe(before);
+  });
+
+  it('falls back to Cloudflare STUN when TURN fails, and keeps handling messages while it waits', async () => {
+    fetchSpy.mockImplementation(() => new Promise((resolve) => setTimeout(() => resolve(new Response('', { status: 500 })), 300)));
+    try {
+      const c = await connect('STN23');
+      c.send({ t: 'hello', pid: 'stun-player-token-1', name: 'Ann' });
+      c.send({ t: 'settings', s: { target: 3 } });
+      const ice = await c.until(isIce);
+      expect(ice.servers).toEqual([{ urls: 'stun:stun.cloudflare.com:3478' }]);
+      const changed = c.messages.findIndex((m) => m.t === 'room' && m.settings.target === 3);
+      expect(changed).toBeGreaterThan(-1);
+      expect(changed).toBeLessThan(c.messages.indexOf(ice));
+      c.ws.close(CLOSE.left);
+    } finally {
+      fetchSpy.mockImplementation(turnApi);
+    }
+  });
+
+  it("relays signals between people in the party with the sender's id, and drops the rest", async () => {
+    const host = await join('SGN23', 'signal-host-token-1', 'Host');
+    const guest = await join('SGN23', 'signal-guest-token-1', 'Guest');
+    host.send({ t: 'addBot', level: 'easy' });
+    const bot = (await guest.until(isRoom((m) => m.players.length === 3))).players[2];
+    const other = await join('SGN23', 'signal-other-token-1', 'Other');
+
+    const offer = { sdp: { type: 'offer', sdp: 'v=0 offer' } };
+    guest.send({ t: 'signal', to: host.id, l: 7, d: offer, from: 'forged' });
+    expect(await host.until(isSignal)).toEqual({ t: 'signal', from: guest.id, l: 7, d: offer });
+
+    host.messages.length = 0;
+    const dropped = [
+      { to: guest.id, l: 7, d: offer },
+      { to: other.id, l: 7, d: offer },
+      { to: bot.id, l: 7, d: offer },
+      { to: 'nobody', l: 7, d: offer },
+      { to: host.id, l: '7', d: offer },
+      { to: host.id, l: 7, d: { sdp: { type: 'pranswer', sdp: 'v=0' } } },
+      { to: host.id, l: 7, d: { ...offer, candidate: null } },
+      { to: host.id, l: 7, d: { candidate: { candidate: 5 } } },
+      { to: host.id, l: 7, d: 'offer' },
+    ];
+    for (const s of dropped) guest.send({ t: 'signal', ...s });
+    guest.send({ t: 'signal', to: host.id, l: 7, d: { candidate: null } });
+    const end = await host.until(isSignal);
+    expect(host.messages.filter(isSignal)).toEqual([{ t: 'signal', from: guest.id, l: 7, d: { candidate: null } }]);
+    expect(end.d).toEqual({ candidate: null });
+
+    // An answer and a burst of candidates fit in one second, well past the 90 a second other messages get.
+    for (let i = 0; i < 200; i++) {
+      host.send({ t: 'signal', to: guest.id, l: 7, d: { candidate: { candidate: `candidate:${i}`, sdpMid: '0', sdpMLineIndex: 0 } } });
+    }
+    const last = { candidate: { candidate: 'candidate:199', sdpMid: '0', sdpMLineIndex: 0 } };
+    await guest.until((m): m is Signal => isSignal(m) && JSON.stringify(m.d) === JSON.stringify(last));
+    expect(guest.messages.filter(isSignal)).toHaveLength(200);
+
+    // Another message dressed as a signal with a repeated key gets neither the signal budget nor handled.
+    host.ws.send('{"t":"signal","t":"settings","s":{"target":3}}');
+    host.send({ t: 'settings', s: { target: 4 } });
+    await guest.until(isRoom((m) => m.settings.target === 4));
+    expect(guest.messages.some((m) => m.t === 'room' && m.settings.target === 3)).toBe(false);
+    expect(other.messages.filter(isSignal)).toEqual([]);
+    for (const c of [host, guest, other]) c.ws.close(CLOSE.left);
+  });
+
+  it("mirrors the host's reports to everyone, and keeps the match over a restart", async () => {
+    const host = await join('MTC23', 'match-host-token-01', 'Host');
+    const guest = await join('MTC23', 'match-guest-token-1', 'Guest');
     host.send({ t: 'start' });
-    await guest.until(isRoom((m) => m.phase === 'countdown'));
-    await guest.until(isRoom((m) => m.phase === 'playing'), 6000);
+    await guest.until(isRoom((m) => m.phase === 'countdown' && m.match === 1 && m.v === 0));
 
-    guest.messages.length = 0;
-    guest.send({ t: 'p', s: 5, q: [0.3, -0.6] });
-    const moved = await guest.until((m): m is SnapMsg => isSnap(m) && Array.isArray(m.m[1]) && Math.abs(m.m[1][0] - 0.3) < 0.01);
-    expect(moved.m[1]).toEqual([expect.closeTo(0.3, 2), expect.closeTo(-0.6, 2)]);
-    expect(moved.a).toEqual([-1, 5]);
+    guest.send({ ...playing(2), v: 5 });
+    host.send(playing(2));
+    expect(await guest.until(isRoom((m) => m.v > 0))).toMatchObject({ phase: 'playing', match: 1, v: 1, k: 180 });
 
+    // A deploy restart drops every socket, and the pages reconnect.
+    await abortAllDurableObjects();
+    await host.closed;
+    const back = await join('MTC23', 'match-host-token-01', 'Host');
+    expect(back.id).toBe(host.id);
+    expect(await back.until(isRoom())).toMatchObject({ phase: 'playing', match: 1, v: 1, k: 180, host: host.id });
+    back.ws.close(CLOSE.left);
+  });
+
+  it('ends the match HOST_GRACE_MS after the host drops, even when a guest dropped first', async () => {
+    const host = await join('HGR23', 'grace-host-token-01', 'Host');
+    const away = await join('HGR23', 'grace-away-token-01', 'Away');
+    const stays = await join('HGR23', 'grace-stays-token-1', 'Stays');
+    host.send({ t: 'start' });
+    host.send(playing(3));
+    await stays.until(isRoom((m) => m.v === 1));
+
+    away.ws.close(1000);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const droppedAt = Date.now();
     host.ws.close(1000);
-    guest.ws.close(1000);
-  }, 20000);
+    const lobby = await stays.until(isRoom((m) => m.phase === 'lobby' && m.match === 1), LOBBY_GRACE_MS);
+    expect(Date.now() - droppedAt).toBeGreaterThanOrEqual(HOST_GRACE_MS);
+    expect(Date.now() - droppedAt).toBeLessThan(LOBBY_GRACE_MS - 1000);
+    expect(lobby.host).toBe(stays.id);
+    stays.ws.close(CLOSE.left);
+  }, 15000);
 
   it('hands the seat back to a player who reconnects with the same token', async () => {
     const a = await connect('RJN45');
     a.send({ t: 'hello', pid: 'rejoin-player-token', name: 'Ann' });
-    const first = await a.until((m): m is Extract<ServerMsg, { t: 'welcome' }> => m.t === 'welcome');
+    const first = await a.until(isWelcome);
 
     const b = await connect('RJN45');
     b.send({ t: 'hello', pid: 'rejoin-player-token', name: 'Ann' });
-    const second = await b.until((m): m is Extract<ServerMsg, { t: 'welcome' }> => m.t === 'welcome');
+    const second = await b.until(isWelcome);
     expect(second.id).toBe(first.id);
     expect((await a.closed).code).toBe(4000);
     b.ws.close(1000);
@@ -125,7 +274,7 @@ describe('Party Durable Object', () => {
     await host.until(isRoom((m) => m.players.length === 1));
     const guest = await connect('SNPPY');
     guest.send({ t: 'hello', pid: 'sleepy-guest-token-1', name: 'Guest' });
-    const first = await guest.until((m): m is Extract<ServerMsg, { t: 'welcome' }> => m.t === 'welcome');
+    const first = await guest.until(isWelcome);
     await host.until(isRoom((m) => m.players.length === 2));
 
     await evictDurableObject(env.PARTY.getByName('SNPPY'));
@@ -136,35 +285,11 @@ describe('Party Durable Object', () => {
 
     const back = await connect('SNPPY');
     back.send({ t: 'hello', pid: 'sleepy-guest-token-1', name: 'Guest' });
-    const again = await back.until((m): m is Extract<ServerMsg, { t: 'welcome' }> => m.t === 'welcome');
+    const again = await back.until(isWelcome);
     expect(again.id).toBe(first.id);
     host.ws.close(CLOSE.left);
     back.ws.close(CLOSE.left);
   });
-
-  // Without the wall-clock lock, setInterval(1000 / 60) ticks at 62.5 Hz in production and at 52 to 56 Hz in local workerd.
-  it('ticks 60 times a second of real time', async () => {
-    const host = await connect('TKR6Q');
-    host.send({ t: 'hello', pid: 'tick-rate-host-token', name: 'Host' });
-    await host.until(isRoom((m) => m.players.length === 1));
-    host.send({ t: 'addBot', level: 'easy' });
-    await host.until(isRoom((m) => m.players.length === 2));
-
-    const snaps: { k: number; at: number }[] = [];
-    host.ws.addEventListener('message', (e) => {
-      const m = JSON.parse(e.data as string) as ServerMsg;
-      if (isSnap(m)) snaps.push({ k: m.k, at: Date.now() });
-    });
-    host.send({ t: 'start' });
-    await new Promise((resolve) => setTimeout(resolve, 2500));
-    host.ws.close(CLOSE.left);
-
-    const first = snaps[0];
-    const last = snaps.at(-1)!;
-    const hz = ((last.k - first.k) * 1000) / (last.at - first.at);
-    expect(hz).toBeGreaterThan(59);
-    expect(hz).toBeLessThan(61);
-  }, 10000);
 
   it("shows everyone a player's reported ping, even after the party went to sleep", async () => {
     const host = await connect('PNG23');

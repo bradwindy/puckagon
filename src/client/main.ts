@@ -3,22 +3,39 @@ import '@fontsource/chakra-petch/700.css';
 import './style.css';
 import { clampToConvex, homePosition, makeLayout, MAX_SEATS, MIN_SEATS, zoneFor } from '../shared/geometry';
 import { createWorld, serve, step, type World } from '../shared/physics';
-import { CODE_ALPHABET, CODE_LENGTH, normalizeCode, PALETTE, sanitizeName, type Phase, type ServerMsg } from '../shared/protocol';
+import {
+  CODE_ALPHABET,
+  CODE_LENGTH,
+  MATCH_PHASES,
+  normalizeCode,
+  PALETTE,
+  sanitizeName,
+  TICK_HZ,
+  type HostMsg,
+  type IceServer,
+  type MatchMsg,
+  type RoomMsg,
+  type ServerMsg,
+} from '../shared/protocol';
 import { DEFAULT_SETTINGS } from '../shared/settings';
 import type { Vec } from '../shared/vec';
 import { Sfx } from './audio';
 import { Fx } from './fx';
+import { HostRuntime } from './host';
 import { InputSampler } from './input';
 import { Net, type NetStatus } from './net';
+import { GuestLink, hasRelay, RELAY } from './peer';
 import { SLOW_MS, UNSTABLE_RATE } from './ping';
 import { predictor } from './predict';
 import { Renderer, type Frame } from './render';
-import { GameState, type Due } from './state';
+import { GameState, mergeRoom, type Due } from './state';
 import { UI } from './ui';
 
 const NAME_KEY = 'puckagon:name';
 const PID_KEY = 'puckagon:pid';
-const MATCH: Phase[] = ['countdown', 'playing', 'scored'];
+const TICK_MS = 1000 / TICK_HZ;
+/** A guest in a match with no snapshot for this long is told it is waiting for the host. */
+const HOST_QUIET_MS = 1000;
 /** Playback stays marked unstable this long after its last late frame, so stutters a second apart count as one spell. */
 const UNSTABLE_HOLD_MS = 2000;
 /** How long the connection must stay slow or unstable before we say so. */
@@ -57,7 +74,7 @@ function playerId(): string {
   return pid;
 }
 
-/** `?ahead=40` in the page URL draws a match at most this many ms ahead of the server, to compare against the default. */
+/** `?ahead=40` in the page URL draws a match at most this many ms ahead of the host, to compare against the default. */
 function aheadFromQuery(search: string): number {
   const n = Number(new URLSearchParams(search).get('ahead') || NaN);
   return n >= 0 ? n : Infinity;
@@ -125,10 +142,28 @@ class PartySession {
   pointer: Vec | null = null;
   private myMallet: Vec | null = null;
   private input = new InputSampler();
+  /** The party's latest room and the host's latest match state. `state.room` is the two merged. */
+  private party: RoomMsg | null = null;
+  private hostMatch: MatchMsg | null = null;
+  private ice: IceServer[] | null = null;
+  /** At most one of these: the match runs on this page, or this page has a game link to the host. */
+  private host: HostRuntime | null = null;
+  private link: GuestLink | null = null;
+  /** The ping last told to the party on this socket, or -1. */
+  private reported = -1;
+  /** When the last snapshot came, or when waiting for one began. */
+  private heardAt = 0;
+  private ended = false;
+  private relayWarned = false;
   private unstableUntil = 0;
   private badSince = Infinity;
   private warned = false;
+  /**
+   * When the merged room's match, phase or phase tick last changed. The countdown counts from it until a snapshot
+   * comes. A new version alone doesn't move it, so the host's first report doesn't restart the count.
+   */
   private roomAt = 0;
+  private roomKey = '';
   private lastCount = 0;
   private celebrateTimer = 0;
 
@@ -143,49 +178,183 @@ class PartySession {
       (msg) => this.onMessage(msg),
       (status) => {
         this.status = status;
-        // A new socket starts with nothing applied, so samples from before it must not count as still to apply.
-        if (status === 'open') this.input.forget();
+        // Another tab took over, or this one can't join, so it stops without a bye: the player hasn't left.
+        if (status === 'replaced' || status === 'outdated' || status === 'full') this.end();
         ui.update(this.state, status);
       },
+      () => this.host?.hosting ?? false,
     );
     this.net.connect();
   }
 
+  /** Leave. The host hears it first, so our goal closes at once. */
   close(): void {
-    clearTimeout(this.celebrateTimer);
+    this.link?.leave();
+    this.link = null;
+    this.end();
     this.net.close();
   }
 
+  private end(): void {
+    this.ended = true;
+    clearTimeout(this.celebrateTimer);
+    this.dropLink();
+    this.dropHost();
+  }
+
   private onMessage(msg: ServerMsg): void {
-    const now = performance.now();
     switch (msg.t) {
       case 'welcome':
+        if (msg.id !== this.state.myId) {
+          this.dropLink();
+          this.dropHost();
+        }
         this.state.myId = msg.id;
+        // The party forgets a ping when the socket drops, and may have missed match reports while it was down.
+        this.reported = -1;
+        this.reportRtt(this.ping());
+        this.host?.resend();
         break;
-      case 'room': {
-        const prev = this.state.room;
-        this.state.onRoom(msg);
-        this.roomAt = now;
-        this.onPhase(prev?.phase, msg.phase, (prev?.players.length ?? 0) < msg.players.length);
-        ui.update(this.state, this.status);
+      case 'ice':
+        this.ice = msg.servers;
+        if (RELAY && !this.relayWarned && !hasRelay(msg.servers)) {
+          this.relayWarned = true;
+          ui.flash("No relay server here, so ?relay=1 can't connect.", 5000);
+        }
+        this.host?.setIce(msg.servers);
+        this.syncRole();
         break;
-      }
-      case 's':
-        this.state.onSnap(msg, now);
+      case 'room':
+        this.party = msg;
+        // A lobby message can come after the next match's state that came over the link, which must survive it.
+        if (msg.phase === 'lobby' && (this.hostMatch?.match ?? 0) <= msg.match) this.hostMatch = null;
+        this.syncRole();
+        this.host?.onRoom(msg);
+        this.applyRoom();
         break;
-      case 'goal':
-        this.state.onGoal(msg.k, msg);
+      case 'signal':
+        if (this.host) this.host.signal(msg.from, msg.l, msg.d);
+        else if (msg.from === this.party?.host) this.link?.signal(msg.l, msg.d);
         break;
-      case 'error':
-        ui.flash(msg.reason, 4000);
+      case 'left':
+        this.host?.quit(msg.id);
         break;
     }
   }
 
-  private onPhase(prev: Phase | undefined, next: Phase, joined: boolean): void {
-    if (prev === next) {
-      if (next === 'lobby' && joined) sfx.join();
+  /** From the host, over the game link, or straight from the worker on the host's own page. */
+  private onHostMsg(msg: HostMsg): void {
+    switch (msg.t) {
+      case 's':
+        if (this.state.onSnap(msg, performance.now())) this.heardAt = performance.now();
+        break;
+      case 'e':
+        this.state.onEvents(msg);
+        break;
+      case 'goal':
+        this.state.onGoal(msg);
+        break;
+      case 'match': {
+        const had = this.hostMatch;
+        if (had && (msg.match < had.match || (msg.match === had.match && msg.v <= had.v))) return;
+        this.hostMatch = msg;
+        this.applyRoom();
+        break;
+      }
+    }
+  }
+
+  /** The party host runs the match on their page. Everyone else keeps a game link to the host. */
+  private syncRole(): void {
+    const room = this.party;
+    const me = this.state.myId;
+    if (this.ended || !room || !me) return;
+    if (room.host === me) {
+      this.dropLink();
+      if (this.host) return;
+      this.host = new HostRuntime(me, {
+        send: (m) => this.net.send(m),
+        deliver: (m) => this.onHostMsg(m),
+        beat: () => this.net.keepalive(),
+      });
+      if (this.ice) this.host.setIce(this.ice);
+      this.reported = -1;
+      this.reportRtt(0);
       return;
+    }
+    if (this.host) {
+      this.dropHost();
+      this.reported = -1;
+    }
+    if (this.link && this.link.host !== room.host) this.dropLink();
+    if (this.link || !room.host || !this.ice) return;
+    const host = room.host;
+    this.link = new GuestLink(host, () => this.ice ?? [], {
+      signal: (l, d) => this.net.send({ t: 'signal', to: host, l, d }),
+      message: (m) => this.onHostMsg(m),
+      change: (up) => {
+        if (!up) return;
+        // A new link starts with nothing applied, so samples from before it must not count as still to apply.
+        this.input.forget();
+        this.heardAt = performance.now();
+      },
+      rtt: (ms) => this.reportRtt(ms),
+    });
+  }
+
+  private dropLink(): void {
+    this.link?.close();
+    this.link = null;
+  }
+
+  private dropHost(): void {
+    this.host?.stop();
+    this.host = null;
+  }
+
+  /** Round trip to the host: 0 on the host's own page, or -1 until this page's link is up and timed. */
+  private ping(): number {
+    if (this.host) return 0;
+    return this.link?.up ? this.link.rtt : -1;
+  }
+
+  private reportRtt(ms: number): void {
+    // The room only shows a change this big, so smaller ones aren't worth a message.
+    if (ms < 0 || (this.reported >= 0 && Math.abs(ms - this.reported) < Math.max(20, this.reported * 0.2))) return;
+    this.reported = ms;
+    this.net.send({ t: 'rtt', ms });
+  }
+
+  private applyRoom(): void {
+    if (!this.party) return;
+    const now = performance.now();
+    const prev = this.state.room;
+    const room = mergeRoom(this.party, this.hostMatch);
+    if (room === prev) return;
+    this.state.onRoom(room);
+    const key = `${room.match}:${room.phase}:${room.k}`;
+    if (key !== this.roomKey) {
+      this.roomKey = key;
+      this.roomAt = now;
+    }
+    if (room.match !== prev?.match) {
+      // Samples kept from the last match may be for another seat or table.
+      this.input.forget();
+      this.heardAt = now;
+    }
+    this.onPhase(prev, room);
+    ui.update(this.state, this.status);
+  }
+
+  private onPhase(before: RoomMsg | null, room: RoomMsg): void {
+    const prev = before?.phase;
+    const next = room.phase;
+    if (prev === next) {
+      if (next === 'lobby' && (before?.players.length ?? 0) < room.players.length) sfx.join();
+      return;
+    }
+    if (before && MATCH_PHASES.includes(before.phase) && next === 'lobby') {
+      ui.flash(before.host !== room.host ? 'The host left, so the match ended.' : 'The match was stopped.', 4000);
     }
     if (next === 'countdown' || next === 'lobby') {
       fx.clear();
@@ -200,7 +369,6 @@ class PartySession {
       }
     }
     if (next === 'over') {
-      const room = this.state.room!;
       const winner = room.players.find((p) => p.id === room.winner);
       this.celebrateTimer = window.setTimeout(() => {
         const { width, height } = renderer.size;
@@ -263,11 +431,14 @@ class PartySession {
     } else if (active < 0) {
       this.myMallet = null;
     }
-    if (active < 0 || !MATCH.includes(room.phase)) return active;
-    // Players who haven't touched the table yet still send samples, from where the server parked their mallet.
+    if (active < 0 || !MATCH_PHASES.includes(room.phase)) return active;
+    // Players who haven't touched the table yet still send samples, from where the host parked their mallet.
     this.myMallet ??= homePosition(layout, active, room.settings.zone);
-    const batch = this.input.sample(now, this.myMallet);
-    if (batch) this.net.send({ t: 'p', ...batch });
+    // The worker on the host's own page gets every message, so only a guest repeats the samples not yet applied.
+    const batch = this.input.sample(now, this.myMallet, this.host ? undefined : st.ack(active));
+    if (!batch) return active;
+    if (this.host) this.host.input(batch.s, batch.q);
+    else this.link?.send({ t: 'p', ...batch });
     return active;
   }
 
@@ -278,7 +449,7 @@ class PartySession {
     if (!room || !layout) return null;
 
     const active = this.steer(now);
-    const inMatch = MATCH.includes(room.phase);
+    const inMatch = MATCH_PHASES.includes(room.phase);
     const open = Array.from({ length: layout.seats }, (_, seat) => !st.bySeat(seat)?.out);
     const predict =
       inMatch && active >= 0 && this.myMallet
@@ -292,13 +463,19 @@ class PartySession {
     const viewSeat = me && me.seat < layout.seats ? me.seat : -1;
     document.body.classList.toggle('aiming', active >= 0);
 
-    const live = this.status === 'open' && inMatch;
+    const waiting = this.waitingFor(now, inMatch);
+    ui.setWaiting(waiting);
+    // A host that stopped sending isn't this player's connection, so it isn't called slow or unstable.
+    const live = inMatch && !waiting;
     if (live && st.lateRate > UNSTABLE_RATE) this.unstableUntil = now + UNSTABLE_HOLD_MS;
     const unstable = live && now < this.unstableUntil;
-    ui.setPing(this.net.rtt, unstable);
-    this.watchConnection(now, this.net.rtt, unstable);
+    const ping = this.ping();
+    ui.setPing(ping, unstable);
+    this.watchConnection(now, waiting ? -1 : ping, unstable);
 
-    const countdown = room.phase === 'countdown' ? Math.max(0, room.timer - (now - this.roomAt)) : 0;
+    // Counted on the host's ticks once they come, so GO lands as the puck appears.
+    const left = view.tick === null ? room.timer - (now - this.roomAt) : room.timer - (view.tick - room.k) * TICK_MS;
+    const countdown = room.phase === 'countdown' ? Math.max(0, Math.min(room.timer, left)) : 0;
     const count = Math.ceil(countdown / 1000);
     if (room.phase === 'countdown' && count > 0 && count !== this.lastCount) {
       this.lastCount = count;
@@ -319,6 +496,13 @@ class PartySession {
       countdown,
       fit,
     };
+  }
+
+  /** What a guest is waiting on in a match: its link to the host, or the host's snapshots. '' for nothing. */
+  private waitingFor(now: number, inMatch: boolean): string {
+    if (!inMatch || this.host) return '';
+    if (!this.link?.up) return 'Connecting to the host…';
+    return now - this.heardAt > HOST_QUIET_MS ? 'Waiting for the host…' : '';
   }
 
   private watchConnection(now: number, rtt: number, unstable: boolean): void {

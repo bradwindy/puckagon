@@ -1,73 +1,51 @@
 import { describe, expect, it } from 'vitest';
 import {
   COUNTDOWN_MS,
+  HOST_GRACE_MS,
+  HOST_SILENT_MS,
   LOBBY_GRACE_MS,
-  RECONNECT_GRACE_MS,
-  TICK_HZ,
+  type MatchMsg,
   type RoomMsg,
+  type SeatState,
   type ServerMsg,
-  type SnapMsg,
 } from '../src/shared/protocol';
-import { resolveGoal } from '../src/shared/rules';
-import { Room } from '../src/worker/room';
+import { Room, type RoomSnapshot } from '../src/worker/room';
 
-const STEP_MS = 1000 / TICK_HZ;
-
-/** Small seeded generator, so bot matches play out the same way on every run. */
-function seeded(seed: number): () => number {
-  return () => {
-    seed = (seed * 16807) % 2147483647;
-    return seed / 2147483647;
-  };
-}
-
-function makeRoom(random: () => number = () => 0.5) {
+function makeRoom() {
   const sent: ServerMsg[] = [];
+  const direct: [string, ServerMsg][] = [];
+  /** When each pid's socket last showed life. Unlisted sockets are always fresh. */
+  const seen = new Map<string, number>();
+  const clock = { now: 1_000_000 };
   let ids = 0;
   const room = new Room({
-    send: (_pid, msg) => sent.push(msg),
+    send: (pid, msg) => {
+      sent.push(msg);
+      direct.push([pid, msg]);
+    },
     broadcast: (msg) => sent.push(msg),
-    random,
     newId: () => `id${ids++}`,
+    seenAt: (pid) => seen.get(pid) ?? clock.now,
   });
-  const clock = { now: 1_000_000 };
   const lastRoom = () => sent.filter((m): m is RoomMsg => m.t === 'room').at(-1)!;
-  const tick = () => room.tick((clock.now += STEP_MS));
-  const tickFor = (ms: number) => {
-    for (let i = 0; i < Math.ceil(ms / STEP_MS) + 1; i++) tick();
-  };
-  /** Fires the puck from the centre straight into a seat's goal, as if `hitter` had just hit it. */
-  const shootAt = (seat: number, hitter: number) => {
-    for (let i = 0; i < 1000 && room.phase !== 'playing'; i++) tick();
-    const w = room.world!;
-    const side = w.layout.sides[w.layout.goalSide[seat]];
-    w.puck = { x: 0, y: 0, vx: -side.normal.x * 2, vy: -side.normal.y * 2 };
-    w.lastHitter = hitter;
-    w.touches = [hitter];
-    w.mallets = w.mallets.map(() => null);
-    for (let i = 0; i < 300 && room.phase === 'playing'; i++) tick();
-  };
-  return { room, sent, lastRoom, clock, tick, tickFor, shootAt };
+  return { room, sent, direct, seen, clock, lastRoom };
 }
 
-function startMatch(names: string[], settings: object = {}) {
+/** Joins each name as pid-0, pid-1, ... and has pid-0, the host, start a match. */
+function startMatch(names: string[]) {
   const r = makeRoom();
   names.forEach((n, i) => r.room.join(`pid-${i}`, n));
-  r.room.updateSettings('pid-0', settings);
   r.room.start('pid-0');
-  r.tickFor(COUNTDOWN_MS);
-  return r;
+  return { ...r, ids: r.lastRoom().players.map((p) => p.id) };
 }
 
-describe('resolveGoal', () => {
-  it('credits the last toucher other than the conceder, and nobody for own goals or untouched pucks', () => {
-    expect(resolveGoal('points', 2, [0])).toEqual({ scorer: 0, kind: 'score' });
-    expect(resolveGoal('points', 2, [2, 0, 1])).toEqual({ scorer: 0, kind: 'score' });
-    expect(resolveGoal('points', 2, [2])).toEqual({ scorer: -1, kind: 'own' });
-    expect(resolveGoal('points', 2, [])).toEqual({ scorer: -1, kind: 'none' });
-    expect(resolveGoal('lives', 2, [2, 1])).toEqual({ scorer: 1, kind: 'life' });
-  });
-});
+const seat = (s: Partial<SeatState> = {}): SeatState => ({ score: 0, lives: 7, out: false, linked: true, ...s });
+
+/** A host report for the match `room` shows. */
+function report(room: RoomMsg, v: number, msg: Partial<MatchMsg> = {}): MatchMsg {
+  const seats = Array.from({ length: room.seats }, () => seat());
+  return { t: 'match', match: room.match, v, phase: 'playing', k: 180, timer: 0, seats, winner: null, ...msg };
+}
 
 describe('Room lobby', () => {
   it('seats players in join order and grows the table', () => {
@@ -144,195 +122,208 @@ describe('Room lobby', () => {
     room.updateSettings('pid-0', { target: 99, speed: 'warp' });
     expect(lastRoom().settings).toMatchObject({ target: 15, speed: 'normal' });
   });
-});
 
-describe('Room match', () => {
-  it('gives the point to the last hitter and ends at the target', () => {
-    const { shootAt, lastRoom } = startMatch(['Ann', 'Ben', 'Cat'], { target: 3 });
-    expect(lastRoom().phase).toBe('playing');
-    for (let i = 0; i < 3; i++) shootAt(1, 0);
-    const end = lastRoom();
-    expect(end.phase).toBe('over');
-    expect(end.players.map((p) => p.score)).toEqual([3, 0, 0]);
-    expect(end.winner).toBe(end.players[0].id);
+  it('keeps the seat and id of a person who drops and says hello again within the grace, in the lobby and mid-match', () => {
+    const { room, sent, lastRoom, clock } = makeRoom();
+    ['Ann', 'Ben', 'Cat'].forEach((n, i) => room.join(`pid-${i}`, n));
+    const before = lastRoom().players.map((p) => [p.id, p.seat]);
+    const rejoin = () => {
+      room.leave('pid-1', clock.now);
+      room.purge(clock.now + LOBBY_GRACE_MS - 1);
+      room.join('pid-1', 'Ben');
+      expect(sent.filter((m) => m.t === 'welcome').at(-1)).toEqual({ t: 'welcome', id: before[1][0] });
+      expect(lastRoom().players.map((p) => [p.id, p.seat])).toEqual(before);
+      expect(lastRoom().players[1].connected).toBe(true);
+    };
+    rejoin();
+    room.start('pid-0');
+    rejoin();
+    expect(lastRoom().phase).toBe('countdown');
   });
 
-  it('does not score own goals', () => {
-    const { shootAt, lastRoom } = startMatch(['Ann', 'Ben']);
-    shootAt(1, 1);
-    expect(lastRoom().players.map((p) => p.score)).toEqual([0, 0]);
-  });
-
-  it('in lives mode, closes the goal of a player who runs out and crowns the last one standing', () => {
-    const { room, shootAt, lastRoom } = startMatch(['Ann', 'Ben', 'Cat'], { mode: 'lives', target: 3 });
-    for (let i = 0; i < 3; i++) shootAt(2, 0);
-    expect(lastRoom().players[2]).toMatchObject({ lives: 0, out: true });
-    expect(room.world!.open[2]).toBe(false);
-    for (let i = 0; i < 3; i++) shootAt(1, 0);
-    expect(lastRoom()).toMatchObject({ phase: 'over', winner: lastRoom().players[0].id });
-  });
-
-  it('turns a dropped player into a wall after the grace period, and late joiners watch', () => {
-    const { room, clock, tickFor, lastRoom } = startMatch(['Ann', 'Ben', 'Cat'], { target: 15 });
-    room.join('late-joiner-pid', 'Late');
-    expect(lastRoom().players.at(-1)!.seat).toBe(-1);
-
-    room.leave('pid-1', clock.now);
-    expect(room.world!.open[1]).toBe(true);
-    tickFor(RECONNECT_GRACE_MS + 100);
-    expect(room.world!.open[1]).toBe(false);
-    expect(lastRoom().players[1]).toMatchObject({ out: true, connected: false });
-    expect(lastRoom().phase).not.toBe('over');
-  });
-
-  it('never credits a player who has been knocked out with a later goal', () => {
-    const { room, clock, tickFor, shootAt, lastRoom } = startMatch(['Ann', 'Ben', 'Cat'], { target: 3 });
-    for (let i = 0; i < 2; i++) shootAt(1, 2);
-    for (let i = 0; i < 300 && room.phase !== 'playing'; i++) tickFor(STEP_MS);
-    const w = room.world!;
-    // Cat's parked mallet touches the puck, then Cat's grace runs out while the puck is held still.
-    w.touches = [2];
-    w.lastHitter = 2;
-    w.frozen = true;
-    room.leave('pid-2', clock.now);
-    tickFor(RECONNECT_GRACE_MS + 100);
-    expect(lastRoom().players[2].out).toBe(true);
-    const side = w.layout.sides[w.layout.goalSide[0]];
-    w.puck = { x: 0, y: 0, vx: -side.normal.x * 2, vy: -side.normal.y * 2 };
-    w.mallets = w.mallets.map(() => null);
-    w.frozen = false;
-    tickFor(1500);
-    expect(lastRoom().players[2].score).toBe(2);
-    expect(lastRoom().phase).not.toBe('over');
-  });
-
-  it('keeps the match going when everyone drops at once, as long as they come back in time', () => {
-    const { room, clock, tickFor, lastRoom } = startMatch(['Ann', 'Ben'], { target: 15 });
+  it('forgets the party once everyone has gone for good, even mid-match', () => {
+    const { room, clock } = startMatch(['Ann', 'Ben']);
     room.leave('pid-0', clock.now);
     room.leave('pid-1', clock.now);
-    tickFor(1000);
-    room.join('pid-0', 'Ann');
-    room.join('pid-1', 'Ben');
-    expect(lastRoom()).toMatchObject({ phase: expect.stringMatching(/playing|scored/) });
-    expect(lastRoom().players.map((p) => p.id)).toEqual(['id0', 'id1']);
-  });
-
-  it('forgets the party once everyone has gone for good', () => {
-    const { room, clock, tickFor } = startMatch(['Ann', 'Ben'], { target: 15 });
-    room.leave('pid-0', clock.now);
-    room.leave('pid-1', clock.now);
-    tickFor(RECONNECT_GRACE_MS + 100);
+    room.purge(clock.now + LOBBY_GRACE_MS);
     expect(room.players).toEqual([]);
     expect(room.phase).toBe('lobby');
   });
+});
 
-  it('lets a dropped player reclaim their seat within the grace period', () => {
-    const { room, clock, tickFor, lastRoom } = startMatch(['Ann', 'Ben'], { target: 15 });
+describe('Room matches', () => {
+  it('opens each match in its countdown with a new number and no report yet', () => {
+    const { room, lastRoom, ids } = startMatch(['Ann', 'Ben']);
+    expect(lastRoom()).toMatchObject({ phase: 'countdown', match: 1, v: 0, k: 0, timer: COUNTDOWN_MS, winner: null });
+    room.report('pid-0', report(lastRoom(), 1, { phase: 'over', winner: ids[0] }));
+    room.again('pid-0');
+    room.start('pid-0');
+    expect(lastRoom()).toMatchObject({ phase: 'countdown', match: 2, v: 0, winner: null });
+  });
+
+  it("mirrors the host's newer reports, shows seated players' links as connected, and ends at over", () => {
+    const { room, lastRoom, ids } = startMatch(['Ann', 'Ben', 'Cat']);
+    const seats = [seat({ score: 2 }), seat({ linked: false }), seat({ lives: 6, out: true })];
+    room.report('pid-0', report(lastRoom(), 1, { phase: 'scored', k: 400, timer: 1600, seats }));
+    expect(lastRoom()).toMatchObject({ phase: 'scored', v: 1, k: 400, timer: 1600 });
+    expect(lastRoom().players.map((p) => [p.score, p.lives, p.out, p.connected])).toEqual([
+      [2, 7, false, true],
+      [0, 7, false, false],
+      [0, 6, true, true],
+    ]);
+
+    room.report('pid-0', report(lastRoom(), 2, { phase: 'over', winner: ids[2] }));
+    expect(lastRoom()).toMatchObject({ phase: 'over', v: 2, winner: ids[2] });
+    room.report('pid-0', report(lastRoom(), 3));
+    expect(lastRoom()).toMatchObject({ phase: 'over', v: 2 });
+  });
+
+  it('ignores reports from anyone but the host, for another match, that are not newer, or that are malformed', () => {
+    const { room, sent, lastRoom } = startMatch(['Ann', 'Ben', 'Cat']);
+    room.join('pid-3', 'Dan');
+    room.report('pid-0', report(lastRoom(), 2));
+    const shown = lastRoom();
+    const before = sent.length;
+    const ignored: [string, MatchMsg][] = [
+      ['pid-1', report(shown, 3)],
+      ['pid-0', report(shown, 3, { match: 2 })],
+      ['pid-0', report(shown, 2)],
+      ['pid-0', report(shown, 1)],
+      ['pid-0', report(shown, 3.5)],
+      ['pid-0', report(shown, 3, { seats: [seat(), seat()] })],
+      ['pid-0', report(shown, 3, { seats: [seat(), seat(), { score: 1, lives: 7, out: false } as SeatState] })],
+      ['pid-0', report(shown, 3, { timer: NaN })],
+      ['pid-0', report(shown, 3, { phase: 'lobby' as MatchMsg['phase'] })],
+      ['pid-0', report(shown, 3, { phase: 'over', winner: shown.players[3].id })],
+      ['pid-0', report(shown, 3, { phase: 'over', winner: 'nobody' })],
+    ];
+    expect(shown.players[3]).toMatchObject({ name: 'Dan', seat: -1 });
+    for (const [pid, msg] of ignored) room.report(pid, msg);
+    expect(sent.length).toBe(before);
+  });
+
+  it('ends the match when the host aborts it, without the players who left for good', () => {
+    const { room, lastRoom, clock, ids } = startMatch(['Ann', 'Ben', 'Cat']);
+    room.report('pid-0', report(lastRoom(), 1, { seats: [seat({ score: 3 }), seat(), seat()] }));
+    room.leave('pid-2', clock.now, true);
+    expect(lastRoom().players.map((p) => p.name)).toEqual(['Ann', 'Ben', 'Cat']);
+
+    room.abort('pid-1', 1);
+    room.abort('pid-0', 2);
+    expect(lastRoom().phase).toBe('playing');
+    room.abort('pid-0', 1);
+    expect(lastRoom()).toMatchObject({ phase: 'lobby', host: ids[0] });
+    expect(lastRoom().players.map((p) => [p.name, p.seat, p.score])).toEqual([
+      ['Ann', 0, 0],
+      ['Ben', 1, 0],
+    ]);
+  });
+
+  it('keeps a seated player who drops listed and in the match, and drops a watcher who leaves at once', () => {
+    const { room, lastRoom, clock } = startMatch(['Ann', 'Ben', 'Cat']);
+    room.report('pid-0', report(lastRoom(), 1));
+    room.join('pid-3', 'Dan');
+    room.leave('pid-3', clock.now);
     room.leave('pid-1', clock.now);
-    tickFor(2000);
-    room.join('pid-1', 'Ben');
-    tickFor(RECONNECT_GRACE_MS);
-    expect(lastRoom().players[1]).toMatchObject({ seat: 1, out: false, connected: true });
+    room.purge(clock.now + LOBBY_GRACE_MS);
+    expect(lastRoom().phase).toBe('playing');
+    expect(lastRoom().players.map((p) => [p.name, p.seat, p.out])).toEqual([
+      ['Ann', 0, false],
+      ['Ben', 1, false],
+      ['Cat', 2, false],
+    ]);
+  });
+
+  it('tells the host when a seated player presses Leave mid-match, but not for a watcher or in the lobby', () => {
+    const { room, direct, lastRoom, clock, ids } = startMatch(['Ann', 'Ben', 'Cat']);
+    const left = () => direct.filter(([, m]) => m.t === 'left');
+    room.join('pid-3', 'Dan');
+    room.leave('pid-3', clock.now, true);
+    room.leave('pid-1', clock.now, true);
+    expect(left()).toEqual([['pid-0', { t: 'left', id: ids[1] }]]);
+
+    room.report('pid-0', report(lastRoom(), 1, { phase: 'over', winner: ids[0] }));
+    room.again('pid-0');
+    room.leave('pid-2', clock.now, true);
+    expect(left()).toHaveLength(1);
+  });
+
+  it("ends the match HOST_GRACE_MS after the host's socket drops and passes host on, unless they come back in time", () => {
+    const { room, lastRoom, clock, ids } = startMatch(['Ann', 'Ben', 'Cat']);
+    room.report('pid-0', report(lastRoom(), 1));
+    room.leave('pid-2', clock.now);
+    clock.now += 1000;
+    room.leave('pid-0', clock.now);
+    expect(room.nextPurgeAt()).toBe(clock.now + HOST_GRACE_MS);
+
+    room.join('pid-0', 'Ann');
+    expect(room.purge(clock.now + HOST_GRACE_MS)).toBe(false);
+    expect(lastRoom()).toMatchObject({ phase: 'playing', host: ids[0] });
+
+    room.leave('pid-0', clock.now);
+    expect(room.purge(clock.now + HOST_GRACE_MS - 1)).toBe(false);
+    expect(room.purge(clock.now + HOST_GRACE_MS)).toBe(true);
+    expect(lastRoom()).toMatchObject({ phase: 'lobby', host: ids[1] });
+    expect(lastRoom().players.map((p) => [p.name, p.connected])).toEqual([
+      ['Ann', false],
+      ['Ben', true],
+      ['Cat', false],
+    ]);
+  });
+
+  it('ends the match at once when the host presses Leave', () => {
+    const { room, lastRoom, clock, ids } = startMatch(['Ann', 'Ben']);
+    room.report('pid-0', report(lastRoom(), 1));
+    room.leave('pid-0', clock.now, true);
+    expect(lastRoom()).toMatchObject({ phase: 'lobby', host: ids[1] });
+    expect(lastRoom().players.map((p) => p.name)).toEqual(['Ben']);
+  });
+
+  it("ends the match when the host's open socket goes quiet for HOST_SILENT_MS", () => {
+    const { room, seen, lastRoom, clock, ids } = startMatch(['Ann', 'Ben']);
+    room.report('pid-0', report(lastRoom(), 1));
+    seen.set('pid-0', clock.now);
+    expect(room.nextPurgeAt()).toBe(clock.now + HOST_SILENT_MS);
+    expect(room.purge(clock.now + HOST_SILENT_MS - 1)).toBe(false);
+    expect(room.purge(clock.now + HOST_SILENT_MS)).toBe(true);
+    expect(lastRoom()).toMatchObject({ phase: 'lobby', host: ids[1] });
+  });
+
+  it('carries a match over a restart, and ends it when the host does not come back', () => {
+    const before = startMatch(['Ann', 'Ben']);
+    before.room.report('pid-0', report(before.lastRoom(), 3, { k: 500 }));
+    const snap = JSON.parse(JSON.stringify(before.room.snapshot())) as RoomSnapshot;
+
+    const { room, lastRoom, clock } = makeRoom();
+    room.restore(snap, new Set(['pid-1']), clock.now, new Map());
+    expect(room.roomMsg()).toMatchObject({ phase: 'playing', match: 1, v: 3, k: 500, host: before.ids[0] });
+    room.purge(clock.now + HOST_GRACE_MS);
+    expect(lastRoom()).toMatchObject({ phase: 'lobby', host: before.ids[1] });
+  });
+
+  it('play again returns everyone to a fresh lobby, without the people who dropped', () => {
+    const { room, lastRoom, clock, ids } = startMatch(['Ann', 'Ben', 'Cat']);
+    room.leave('pid-2', clock.now);
+    const seats = [seat({ score: 4, lives: 3 }), seat({ score: 2, lives: 0, out: true }), seat({ linked: false })];
+    room.report('pid-0', report(lastRoom(), 1, { phase: 'over', winner: ids[0], seats }));
+    room.again('pid-0');
+    expect(lastRoom()).toMatchObject({ phase: 'lobby', winner: null, seats: 2, timer: 0 });
+    expect(lastRoom().players.map((p) => [p.name, p.seat, p.score, p.lives, p.out])).toEqual([
+      ['Ann', 0, 0, 7, false],
+      ['Ben', 1, 0, 7, false],
+    ]);
   });
 
   it('gives people who watched a seat ahead of everyone else at play again', () => {
     const r = makeRoom();
     for (let i = 0; i < 13; i++) r.room.join(`pid-${i}`, `P${i}`);
-    r.room.updateSettings('pid-0', { target: 3 });
     r.room.start('pid-0');
-    r.tickFor(COUNTDOWN_MS);
-    for (let i = 0; i < 3; i++) r.shootAt(1, 0);
+    r.room.report('pid-0', report(r.lastRoom(), 1, { phase: 'over', winner: r.lastRoom().players[0].id }));
     r.room.again('pid-0');
     const seats = Object.fromEntries(r.lastRoom().players.map((p) => [p.name, p.seat]));
     expect(seats.P12).toBe(0);
     expect(Object.values(seats).filter((s) => s < 0)).toHaveLength(1);
-  });
-
-  it('play again returns everyone to a fresh lobby', () => {
-    const { room, shootAt, lastRoom } = startMatch(['Ann', 'Ben'], { target: 3 });
-    for (let i = 0; i < 3; i++) shootAt(1, 0);
-    room.again('pid-0');
-    expect(lastRoom()).toMatchObject({ phase: 'lobby', winner: null });
-    expect(lastRoom().players.map((p) => p.score)).toEqual([0, 0]);
-  });
-});
-
-describe('Room input', () => {
-  /** Points on a line from seat 0's mallet towards the centre, `step` apart. */
-  const sweep = (room: Room, step: number) => {
-    const { x, y } = room.world!.mallets[0]!;
-    const d = Math.hypot(x, y);
-    return (i: number) => [x - (x / d) * step * i, y - (y / d) * step * i];
-  };
-  const mallet = (room: Room) => room.world!.mallets[0]!;
-
-  it('moves the mallet the same distance every tick when samples arrive two at a time', () => {
-    const { room, tick } = startMatch(['Ann', 'Ben']);
-    const at = sweep(room, 0.01);
-    const moved: number[] = [];
-    for (let i = 1; i < 20; i += 2) {
-      room.input('pid-0', i, [...at(i), ...at(i + 1)]);
-      for (let j = 0; j < 2; j++) {
-        const { x, y } = mallet(room);
-        tick();
-        moved.push(Math.round(Math.hypot(mallet(room).x - x, mallet(room).y - y) * 1000) / 1000);
-      }
-    }
-    expect(moved).toEqual(moved.map(() => 0.01));
-  });
-
-  it('keeps only the newest four samples, holds the last one, and ignores malformed input', () => {
-    const { room, tick } = startMatch(['Ann', 'Ben']);
-    const at = sweep(room, 0.05);
-    const target = () => [mallet(room).tx, mallet(room).ty];
-    room.input('pid-0', 1, [...at(1), ...at(2)]);
-    room.input('pid-0', 3, [...at(3), ...at(4), ...at(5)]);
-    tick();
-    expect(target()).toEqual(at(2));
-    for (let i = 0; i < 4; i++) tick();
-    expect(target()).toEqual(at(5));
-    const badSamples = [[at(1)[0]], [...at(1), ...at(2), ...at(3), ...at(4), ...at(6)], [at(1)[0], NaN], [at(1)[0], '0.1'], 'x'];
-    const bad = [...badSamples.map((q) => [6, q]), ...[-1, 6.5, Infinity, '6', undefined].map((s) => [s, at(6)])];
-    for (const [s, q] of bad) {
-      room.input('pid-0', s, q);
-      tick();
-      expect(target()).toEqual(at(5));
-    }
-  });
-
-  const lastAcks = (sent: ServerMsg[]) => sent.filter((m): m is SnapMsg => m.t === 's').at(-1)!.a;
-
-  it('acks the last sample applied in every snapshot, skips samples the queue dropped, and starts over on rejoin', () => {
-    const { room, sent, tick } = startMatch(['Ann', 'Ben']);
-    const at = sweep(room, 0.001);
-    tick();
-    expect(lastAcks(sent)).toEqual([-1, -1]);
-
-    const acks: number[] = [];
-    for (let s = 0; s < 40; s += 2) {
-      room.input('pid-0', s, [...at(s), ...at(s + 1)]);
-      for (let j = 0; j < 2; j++) {
-        tick();
-        acks.push(lastAcks(sent)[0]);
-      }
-    }
-    expect(acks).toEqual(acks.map((_, i) => i));
-
-    room.input('pid-0', 40, [...at(40), ...at(41), ...at(42)]);
-    room.input('pid-0', 43, [...at(43), ...at(44), ...at(45)]);
-    acks.length = 0;
-    for (let i = 0; i < 5; i++) {
-      tick();
-      acks.push(lastAcks(sent)[0]);
-    }
-    expect(acks).toEqual([42, 43, 44, 45, 45]);
-
-    room.join('pid-0', 'Ann');
-    tick();
-    expect(lastAcks(sent)).toEqual([-1, -1]);
-    room.input('pid-0', 7, at(7));
-    tick();
-    expect(lastAcks(sent)).toEqual([7, -1]);
+    expect(r.lastRoom()).toMatchObject({ phase: 'lobby', winner: null });
   });
 });
 
@@ -359,54 +350,6 @@ describe('Room pings', () => {
     room.leave('pid-b', clock.now);
     room.join('pid-b', 'Ben');
     expect(pings()).toEqual([-1, -1, -1]);
-  });
-});
-
-describe('Room hit events', () => {
-  it('keeps a held puck quiet after its first contact, and sends at most one hit per seat every four ticks', () => {
-    const { room, sent, tick } = startMatch(['Ann', 'Ben']);
-    const w = room.world!;
-    const events = (kind: 0 | 1, from: number) =>
-      sent
-        .slice(from)
-        .filter((m): m is SnapMsg => m.t === 's')
-        .flatMap((m) => m.e.filter((e) => e[0] === kind).map((e) => e[4]));
-    /** Puts the puck against a seat's mallet, `angle` radians round from the side facing the centre, moving into it. */
-    const strike = (seat: number, angle: number) => {
-      const m = w.mallets[seat]!;
-      const toCentre = Math.atan2(-m.y, -m.x) + angle;
-      const [nx, ny] = [Math.cos(toCentre), Math.sin(toCentre)];
-      const gap = w.layout.puckR + w.layout.malletR + 0.01;
-      w.puck = { x: m.x + nx * gap, y: m.y + ny * gap, vx: -nx * 3, vy: -ny * 3 };
-    };
-
-    let from = sent.length;
-    for (let i = 0; i < 16; i++) {
-      strike(i % 2, 0);
-      tick();
-    }
-    expect(events(0, from)).toEqual([0, 1]);
-
-    w.puck = { x: 0, y: 0, vx: 0, vy: 0 };
-    for (let i = 0; i < 30; i++) tick();
-    from = sent.length;
-    for (let i = 0; i < 16; i++) {
-      strike(i % 2, ((i >> 1) - 3.5) * 0.4);
-      tick();
-    }
-    const hits = events(0, from);
-    expect(hits.filter((seat) => seat === 0)).toHaveLength(4);
-    expect(hits.filter((seat) => seat === 1)).toHaveLength(4);
-
-    from = sent.length;
-    const wall = w.layout.sides.find((s) => s.owner < 0)!;
-    for (let i = 0; i < 16; i++) {
-      const { mid, normal } = wall;
-      const gap = w.layout.puckR + 0.01;
-      w.puck = { x: mid.x + normal.x * gap, y: mid.y + normal.y * gap, vx: -normal.x * 3, vy: -normal.y * 3 };
-      tick();
-    }
-    expect(events(1, from)).toHaveLength(1);
   });
 });
 
@@ -439,20 +382,5 @@ describe('Room bots', () => {
     expect(lastRoom().phase).toBe('countdown');
     room.leave('pid-0', clock.now, true);
     expect(room.players).toEqual([]);
-  });
-
-  it('bots of each level play a full match to the end without a person touching the puck', () => {
-    for (const level of ['easy', 'medium', 'hard'] as const) {
-      const r = makeRoom(seeded(7));
-      r.room.join('pid-0', 'Idle');
-      r.room.addBot('pid-0', level);
-      r.room.addBot('pid-0', level);
-      r.room.updateSettings('pid-0', { target: 3 });
-      r.room.start('pid-0');
-      for (let i = 0; i < 5 * 60 * TICK_HZ && r.room.phase !== 'over'; i++) r.tick();
-      expect(r.room.phase).toBe('over');
-      const goals = r.sent.filter((m) => m.t === 'goal');
-      expect(goals.filter((g) => g.t === 'goal' && g.kind === 'score').length).toBeGreaterThanOrEqual(3);
-    }
   });
 });

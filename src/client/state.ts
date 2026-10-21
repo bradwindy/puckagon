@@ -1,5 +1,18 @@
 import { makeLayout, type Layout } from '../shared/geometry';
-import { SNAP_EVERY, TICK_HZ, type GoalInfo, type PublicPlayer, type RoomMsg, type SnapMsg, type WireEvent } from '../shared/protocol';
+import {
+  MATCH_PHASES,
+  SNAP_EVERY,
+  TICK_HZ,
+  type EventMsg,
+  type GoalInfo,
+  type GoalMsg,
+  type MatchMsg,
+  type PublicPlayer,
+  type RoomMsg,
+  type SnapMsg,
+  type WireEvent,
+} from '../shared/protocol';
+import { HIT_EVENT_GAP, SAME_SPOT, SAME_SPOT_TICKS } from '../shared/rules';
 import type { Vec } from '../shared/vec';
 import type { Prediction, PuckState } from './predict';
 
@@ -40,23 +53,39 @@ const RESYNC_TICKS = 3;
 /** Time constant of the offset that hides corrections to the predicted puck and mallets. A bigger correction is a jump. */
 const CORRECTION_MS = 80;
 const MAX_CORRECTION = 0.5;
-/** A server event is the same as a shown predicted one of its kind and seat this many ticks either side. */
+/** A host event is the same as a shown predicted one of its kind and seat this many ticks either side. */
 const MATCH_TICKS = 3;
-/** How long shown events are remembered, so a late server copy of a predicted one is still recognised. */
+/** How long shown events are remembered, so a late host copy of a predicted one is still recognised. */
 const MEMORY_TICKS = 60;
-/** The room's rules for which events reach clients (see room.ts), applied to predicted ones. */
-const HIT_EVENT_GAP = 4;
-const SAME_SPOT = 0.02;
-const SAME_SPOT_TICKS = 30;
 
 const clamp = (n: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, n));
+
+/**
+ * The room as the game shows it: the party's room, with the host's match state laid over it when that is newer. The
+ * party mirrors what the host reports, so the two only differ while one copy is on its way.
+ */
+export function mergeRoom(room: RoomMsg, match: MatchMsg | null): RoomMsg {
+  if (!match || room.phase === 'lobby' || match.match !== room.match || match.v <= room.v) return room;
+  return {
+    ...room,
+    phase: match.phase,
+    v: match.v,
+    k: match.k,
+    timer: match.timer,
+    winner: match.winner,
+    players: room.players.map((p) => {
+      const s = p.seat >= 0 ? match.seats[p.seat] : undefined;
+      return s ? { ...p, score: s.score, lives: s.lives, out: s.out, connected: s.linked } : p;
+    }),
+  };
+}
 
 export interface Snap {
   k: number;
   puck: [number, number, number, number];
   mallets: ([number, number] | 0)[];
   hitter: number;
-  /** By seat, the sequence number of the last pointer sample the server applied, or -1. */
+  /** By seat, the sequence number of the last pointer sample the host applied, or -1. */
   acks: number[];
   /** By seat, how far each mallet moved per tick over the last couple of snapshots. */
   motion: ([number, number] | 0)[];
@@ -75,6 +104,8 @@ export interface View {
   due: Due[];
   /** True once per serve, on the first frame the served puck is visible. */
   served: boolean;
+  /** The host tick the puck is drawn at, or null before the first snapshot of the match. */
+  tick: number | null;
 }
 
 export type Due = { kind: 'event'; e: WireEvent } | { kind: 'goal'; goal: GoalInfo };
@@ -83,14 +114,14 @@ interface Fired {
   k: number;
   e: WireEvent;
   predicted: boolean;
-  /** A predicted event the server has since confirmed. */
+  /** A predicted event the host has since confirmed. */
   matched: boolean;
   /** Last tick this spot was touched, which keeps a held puck quiet. */
   seen: number;
 }
 
 export class GameState {
-  /** `aheadMs` caps how far ahead of the server's newest state a match is drawn. Below local time your mallet trails your hand. */
+  /** `aheadMs` caps how far ahead of the host's newest state a match is drawn. Below local time your mallet trails your hand. */
   constructor(private aheadMs = Infinity) {}
 
   room: RoomMsg | null = null;
@@ -141,7 +172,7 @@ export class GameState {
     return this.late;
   }
 
-  /** The sequence number of the last sample the server applied for a seat, as of the newest snapshot. */
+  /** The sequence number of the last sample the host applied for a seat, as of the newest snapshot. */
   ack(seat: number): number {
     return this.snaps.at(-1)?.acks[seat] ?? -1;
   }
@@ -172,21 +203,25 @@ export class GameState {
       this.layoutKey = key;
       this.layout = makeLayout(msg.seats, msg.settings);
     }
-    if (msg.phase === 'lobby') {
-      // The server tick doesn't advance between matches, so the clock estimate must start again.
+    if (msg.phase === 'lobby' || msg.match !== prev?.match) {
+      // Each match counts its ticks from 0, so the clock estimate must start again.
       this.resetClock();
       this.hiddenFrom = this.showFrom = Infinity;
     }
     if (!prev && msg.phase === 'scored') this.hiddenFrom = -Infinity;
     if (msg.phase === 'playing' && prev?.phase !== 'playing') {
       this.hiddenFrom = -Infinity;
-      // The serve happens on the tick after the last snap we have, and shows up in the next snap.
-      this.showFrom = (this.snaps.at(-1)?.k ?? 0) + SNAP_EVERY;
+      this.showFrom = msg.k;
     }
   }
 
-  onSnap(msg: SnapMsg, now: number): void {
-    if (msg.k <= (this.snaps.at(-1)?.k ?? -1)) this.resetClock();
+  /**
+   * Takes a snapshot of the current match. Snapshots come on an unordered channel, so one at or below the newest tick
+   * is late and dropped. Returns whether it was taken.
+   */
+  onSnap(msg: SnapMsg, now: number): boolean {
+    const room = this.room;
+    if (!room || room.phase === 'lobby' || msg.n !== room.match || msg.k <= (this.snaps.at(-1)?.k ?? -1)) return false;
     const prevAt = this.arrivals.at(-1)?.at;
     const estimate = now - msg.k * TICK_MS;
     this.arrivals.push({ at: now, estimate });
@@ -194,7 +229,7 @@ export class GameState {
     const recent = this.arrivals.filter((a) => a.at >= now - REANCHOR_MS);
     const reanchor = recent[0].at <= now - REANCHOR_SPAN_MS && recent.every((a) => a.estimate > this.offset + this.delay);
     if (reanchor) {
-      // Every recent snapshot came too late to play, so the server skipped ticks or the route got slower. Drifting there
+      // Every recent snapshot came too late to play, so the host skipped ticks or the route got slower. Drifting there
       // would leave playback ahead of the snapshots for up to a second. Spreads measured against the old clock no longer apply.
       this.arrivals = recent;
       this.spreads = [];
@@ -220,11 +255,21 @@ export class GameState {
     });
     this.snaps.push({ k: msg.k, puck: msg.p, mallets: msg.m, hitter: msg.h, acks: msg.a, motion });
     if (this.snaps.length > 40) this.snaps.shift();
+    return true;
+  }
+
+  onEvents(msg: EventMsg): void {
+    if (msg.n !== this.room?.match) return;
     for (const e of msg.e) this.arrive(msg.k, e);
   }
 
-  onGoal(k: number, goal: GoalInfo): void {
-    this.queue.push({ k, due: { kind: 'goal', goal } });
+  onGoal(msg: GoalMsg): void {
+    const room = this.room;
+    if (msg.n !== room?.match) return;
+    const { k } = msg;
+    this.queue.push({ k, due: { kind: 'goal', goal: msg } });
+    // A goal message that comes after the serve that followed it shows its effect but mustn't hide the puck in play.
+    if (room.phase === 'playing' && room.k > k) return;
     // Set on arrival rather than when due, so a later serve message always wins even if frames were paused. A puck
     // already hidden at a predicted goal stays hidden.
     this.hiddenFrom = this.guessedGoal ? Math.min(k, this.puckTick) : k;
@@ -232,7 +277,7 @@ export class GameState {
   }
 
   /**
-   * The interpolated past: the server tick other mallets are drawn at. It never goes back, so when the clock re-anchors
+   * The interpolated past: the host tick other mallets are drawn at. It never goes back, so when the clock re-anchors
    * or slews back they pause instead of rewinding.
    */
   renderTick(now: number): number {
@@ -247,7 +292,7 @@ export class GameState {
    */
   view(now: number, predict: Predictor | null = null): View {
     const newest = this.snaps.at(-1);
-    if (!newest) return { puck: null, speed: 0, mallets: [], hitter: -1, mallet: null, due: [], served: false };
+    if (!newest) return { puck: null, speed: 0, mallets: [], hitter: -1, mallet: null, due: [], served: false, tick: null };
     const past = this.renderTick(now);
     const dt = Number.isFinite(this.viewedAt) ? Math.max(0, now - this.viewedAt) : 0;
     this.viewedAt = now;
@@ -283,7 +328,7 @@ export class GameState {
     }
     const base = this.base;
     if (!resync && base && (base.predicted || lead) && (base.snap !== newest || base.predicted !== !!lead)) {
-      // Your own input is the same in both, so only what the server changed is smoothed.
+      // Your own input is the same in both, so only what the host changed is smoothed.
       const old = base.predicted ? (predict?.(base.snap, base.live) ?? base.lead) : null;
       const was = this.puckAt(tick, base.snap, old && old.puck.length > 0 ? old : null);
       const is = this.puckAt(tick, newest, lead);
@@ -316,7 +361,7 @@ export class GameState {
 
     const due = this.fire(from, tick, newest.k, lead);
 
-    if (phase === 'countdown' || phase === 'playing' || phase === 'scored') {
+    if (phase && MATCH_PHASES.includes(phase)) {
       const late = past > newest.k ? 1 : 0;
       this.late += (late - this.late) * (1 - Math.exp(-Math.max(0, now - this.sampledAt) / LATE_MS));
     }
@@ -330,6 +375,7 @@ export class GameState {
       mallet: pred ? mallets[pred.seat] : null,
       due,
       served,
+      tick,
     };
   }
 
@@ -362,7 +408,7 @@ export class GameState {
     return o ? { x: m.x + o.x, y: m.y + o.y } : m;
   }
 
-  /** The events of every tick the puck's timeline crossed this frame: the server's up to the newest snapshot, predicted ones after it. */
+  /** The events of every tick the puck's timeline crossed this frame: the host's up to the newest snapshot, predicted ones after it. */
   private fire(from: number, to: number, newest: number, lead: Prediction | null): Due[] {
     const due: Due[] = [];
     this.queue = this.queue.filter((q) => {
@@ -388,7 +434,7 @@ export class GameState {
     return due;
   }
 
-  /** Queues a server event, unless a predicted one already showed it, or its tick was shown in local time too long ago. */
+  /** Queues a host event, unless a predicted one already showed it, or its tick was shown in local time too long ago. */
   private arrive(k: number, e: WireEvent): void {
     const twin = this.fired.find(
       (f) => f.predicted && !f.matched && f.e[0] === e[0] && f.e[4] === e[4] && Math.abs(f.k - k) <= MATCH_TICKS,
@@ -401,7 +447,7 @@ export class GameState {
     this.queue.push({ k, due: { kind: 'event', e } });
   }
 
-  /** True for a predicted event a client wouldn't get from the server, or one the server already sent. */
+  /** True for a predicted event a client wouldn't get from the host, or one the host already sent. */
   private quiet(k: number, e: WireEvent): boolean {
     for (const f of this.fired) {
       if (f.e[4] !== e[4]) continue;

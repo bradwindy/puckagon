@@ -1,33 +1,28 @@
-import { homePosition, makeLayout, MAX_SEATS, MIN_SEATS } from '../shared/geometry';
-import { createWorld, placeMallet, resetPuck, serve, setTarget, step, type World } from '../shared/physics';
+import { MAX_SEATS, MIN_SEATS } from '../shared/geometry';
 import {
-  COUNTDOWN_MS,
-  PALETTE,
-  LOBBY_GRACE_MS,
-  MAX_SAMPLES,
-  RECONNECT_GRACE_MS,
-  round,
-  SCORED_MS,
-  SNAP_EVERY,
-  TICK_HZ,
   BOT_LEVELS,
+  COUNTDOWN_MS,
+  HOST_GRACE_MS,
+  HOST_SILENT_MS,
+  LOBBY_GRACE_MS,
+  MATCH_PHASES,
+  PALETTE,
   type BotLevel,
+  type MatchMsg,
   type Phase,
   type PublicPlayer,
   type RoomMsg,
+  type SeatState,
   type ServerMsg,
-  type WireEvent,
 } from '../shared/protocol';
-import { resolveGoal } from '../shared/rules';
 import { DEFAULT_SETTINGS, sanitizeSettings, type Settings } from '../shared/settings';
-import type { Vec } from '../shared/vec';
-import { BOT_NAMES, botTarget, newBrain, type BotBrain } from './bot';
 
 export interface RoomIO {
   send(pid: string, msg: ServerMsg): void;
   broadcast(msg: ServerMsg): void;
-  random(): number;
   newId(): string;
+  /** When the player's socket last showed it is alive (ms), or null when they have no socket. */
+  seenAt(pid: string): number | null;
 }
 
 export interface Player {
@@ -39,24 +34,14 @@ export interface Player {
   score: number;
   lives: number;
   out: boolean;
+  /** Whether the player's socket to the party is open. */
   connected: boolean;
+  /** Whether the host last reported a working game link for this seat. Shown as `connected` during a match. */
+  linked: boolean;
   /** When the player's socket dropped (ms), or -1 while connected or once their grace has been spent. */
   goneAt: number;
   /** Difficulty for computer players, null for people. Bots have no socket and are always connected. */
   bot: BotLevel | null;
-}
-
-interface Sample extends Vec {
-  seq: number;
-}
-
-interface Inputs {
-  queue: Sample[];
-  /** Sequence number of the last sample a tick applied, or -1. */
-  applied: number;
-  /** The fewest samples left waiting after a tick, over the ticks since the last check. */
-  spare: number;
-  watched: number;
 }
 
 export interface RoomSnapshot {
@@ -65,37 +50,28 @@ export interface RoomSnapshot {
   host: string;
   winner: string | null;
   seats: number;
+  match: number;
+  v: number;
+  k: number;
+  timer: number;
   players: Player[];
 }
 
-const STEP_MS = 1000 / TICK_HZ;
-const ticks = (ms: number) => Math.round(ms / STEP_MS);
-const COUNTDOWN_TICKS = ticks(COUNTDOWN_MS);
-const SCORED_TICKS = ticks(SCORED_MS);
-const MATCH_PHASES: Phase[] = ['countdown', 'playing', 'scored'];
-/** Pointer samples a player may have waiting. More would add lag after a burst of late messages. */
-const INPUT_QUEUE = 4;
-/**
- * A player who always had a sample to spare over this many ticks skips one, so the wait a burst of messages leaves
- * behind drains away instead of adding lag for the rest of the match.
- */
-const DRAIN_TICKS = 8;
-/** A puck jammed against a mallet makes a hit every tick. Only one hit per seat this many ticks apart reaches clients. */
-const HIT_EVENT_GAP = 4;
-/**
- * A held puck touches the same spot every tick. An event this close to one of the last few with the same seat (walls
- * share one key), within this many ticks of it, is the same contact and stays quiet for as long as the hold lasts.
- */
-const SAME_SPOT = 0.02;
-const SAME_SPOT_TICKS = 30;
-const SPOTS_KEPT = 4;
+const REPORT_PHASES: Phase[] = [...MATCH_PHASES, 'over'];
 const MAX_PING_MS = 9999;
 /** Twelve seats plus a bench. Joins past this are turned away. */
 export const MAX_PLAYERS = 24;
+const BOT_NAMES = ['Robo', 'Bleep', 'Sparky', 'Gizmo', 'Turbo', 'Pixel', 'Widget', 'Nibbles', 'Chip', 'Zap', 'Bolt', 'Dot'];
+
+const isSeatState = (s: unknown): s is SeatState => {
+  if (typeof s !== 'object' || s === null) return false;
+  const { score, lives, out, linked } = s as Record<string, unknown>;
+  return Number.isFinite(score) && Number.isFinite(lives) && typeof out === 'boolean' && typeof linked === 'boolean';
+};
 
 /**
- * One party's game rules, independent of Durable Object plumbing.
- * Time only moves through tick(), one fixed physics step per call.
+ * One party's lobby, independent of Durable Object plumbing. The host's browser runs each match and reports its state,
+ * which the room mirrors so everyone, including people who join mid-match, sees the same scores.
  */
 export class Room {
   phase: Phase = 'lobby';
@@ -104,15 +80,15 @@ export class Room {
   host = '';
   winner: string | null = null;
   seats = MIN_SEATS;
-  world: World | null = null;
+  /** Number of the match in play or last played. */
+  match = 0;
+  /** Version of the host's last accepted report. */
+  v = 0;
+  /** Host tick at which the reported phase began. */
+  k = 0;
+  /** ms left in a countdown or goal pause, as of the host's last report. */
+  timer = 0;
 
-  private timer = 0;
-  private lastConceded = -1;
-  private tickCount = 0;
-  private pending: WireEvent[] = [];
-  private brains = new Map<string, BotBrain>();
-  private inputs = new Map<string, Inputs>();
-  private spots = new Map<number, { k: number; x: number; y: number }[]>();
   /** Last ping shown to the room, by pid. Kept off Player so it is never written to storage. */
   private pings = new Map<string, number>();
 
@@ -129,14 +105,18 @@ export class Room {
       host: this.host,
       winner: this.winner,
       seats: this.seats,
+      match: this.match,
+      v: this.v,
+      k: this.k,
+      timer: this.timer,
       players: this.players,
     };
   }
 
   /**
-   * Rebuilds after the Durable Object wakes. Players whose socket is gone get a fresh reconnect grace,
-   * so a close that woke the object, or a deploy restart, still runs through the normal leave path.
-   * A match can't survive a restart, so it falls back to the lobby. `pings` holds the last ping shown for live players.
+   * Rebuilds after the Durable Object wakes. Players whose socket is gone get a fresh grace, so a close that woke the
+   * object, or a deploy restart, still runs through the normal leave path, and a host who doesn't come back ends the
+   * match after HOST_GRACE_MS. `pings` holds the last ping shown for live players.
    */
   restore(snap: RoomSnapshot, livePids: Set<string>, now: number, pings: Map<string, number>): void {
     this.settings = sanitizeSettings(snap.settings);
@@ -144,12 +124,18 @@ export class Room {
     this.players = snap.players.map((p) => {
       const bot = p.bot ?? null;
       const connected = bot !== null || livePids.has(p.pid);
-      return { ...p, bot, connected, goneAt: connected ? -1 : now };
+      return { ...p, bot, connected, linked: p.linked ?? true, goneAt: connected ? -1 : now };
     });
     this.host = snap.host;
     this.winner = snap.winner;
     this.seats = snap.seats;
-    this.phase = snap.phase === 'over' ? 'over' : 'lobby';
+    // Snapshots from before the host ran matches have no match number, and nobody could carry those matches on.
+    this.match = snap.match ?? 0;
+    this.v = snap.v ?? 0;
+    this.k = snap.k ?? 0;
+    this.timer = snap.timer ?? 0;
+    const keep = snap.phase === 'over' || (MATCH_PHASES.includes(snap.phase) && this.match > 0);
+    this.phase = keep ? snap.phase : 'lobby';
     if (this.phase === 'lobby') this.resetForLobby();
     this.ensureHost();
   }
@@ -158,7 +144,19 @@ export class Room {
     return this.players.find((p) => p.pid === pid);
   }
 
+  idOf(pid: string): string | undefined {
+    return this.find(pid)?.id;
+  }
+
+  /** The connected person, other than `from`, whose public id is `to`. Game links only join the host and a guest. */
+  peer(from: string, to: unknown): Player | undefined {
+    return this.players.find(
+      (p) => p.id === to && p.pid !== from && p.connected && !p.bot && (from === this.host || p.pid === this.host),
+    );
+  }
+
   private publicPlayer(p: Player): PublicPlayer {
+    const connected = this.inMatch && p.seat >= 0 ? p.linked : p.connected;
     return {
       id: p.id,
       name: p.name,
@@ -167,9 +165,9 @@ export class Room {
       score: p.score,
       lives: p.lives,
       out: p.out,
-      connected: p.connected,
+      connected,
       bot: p.bot,
-      ping: p.bot || !p.connected ? -1 : (this.pings.get(p.pid) ?? -1),
+      ping: p.bot || !connected ? -1 : (this.pings.get(p.pid) ?? -1),
     };
   }
 
@@ -181,8 +179,11 @@ export class Room {
       settings: this.settings,
       players: this.players.map((p) => this.publicPlayer(p)),
       seats: this.seats,
-      timer: this.phase === 'countdown' || this.phase === 'scored' ? Math.round(this.timer * STEP_MS) : 0,
+      timer: this.timer,
       winner: this.winner ? (this.find(this.winner)?.id ?? null) : null,
+      match: this.match,
+      v: this.v,
+      k: this.k,
     };
   }
 
@@ -197,6 +198,12 @@ export class Room {
     this.host = this.players.find((p) => p.connected && !p.bot)?.pid ?? '';
   }
 
+  /** Hands host to the first connected person other than the current host, if there is one. */
+  private passHost(): void {
+    const next = this.players.find((p) => p.connected && !p.bot && p.pid !== this.host);
+    if (next) this.host = next.pid;
+  }
+
   private reseatLobby(): void {
     let seat = 0;
     for (const p of this.players) p.seat = seat < MAX_SEATS ? seat++ : -1;
@@ -204,13 +211,21 @@ export class Room {
   }
 
   private resetForLobby(): void {
-    this.world = null;
+    this.timer = 0;
     for (const p of this.players) {
       p.score = 0;
       p.lives = this.settings.target;
       p.out = false;
     }
     this.reseatLobby();
+  }
+
+  /** Ends a match before its result: back to a fresh lobby, without the players who left for good. */
+  private endMatch(): void {
+    this.players = this.players.filter((p) => p.connected || p.goneAt >= 0);
+    this.phase = 'lobby';
+    this.winner = null;
+    this.resetForLobby();
   }
 
   private newPlayer(pid: string, name: string, bot: BotLevel | null): Player {
@@ -226,6 +241,7 @@ export class Room {
       lives: this.settings.target,
       out: false,
       connected: true,
+      linked: true,
       goneAt: -1,
       bot,
     };
@@ -235,7 +251,6 @@ export class Room {
   }
 
   join(pid: string, name: string): Player {
-    this.inputs.delete(pid);
     let p = this.find(pid);
     if (p) {
       p.connected = true;
@@ -265,85 +280,89 @@ export class Room {
     const bot = this.players.find((p) => p.bot && p.id === id);
     if (!bot) return;
     this.players = this.players.filter((p) => p !== bot);
-    this.brains.delete(bot.pid);
     this.reseatLobby();
     this.broadcastRoom();
   }
 
   /**
-   * A socket closed. After a dropped connection the player keeps their place for a short grace period
-   * in case they are reloading. After pressing Leave (`quit`) they are gone at once.
+   * A socket closed. After a dropped connection the player keeps their place for a short grace period in case they
+   * are reloading. After pressing Leave (`quit`) they are gone at once. A host who quits ends the match, and a seated
+   * player who quits has their goal closed by the host.
    */
   leave(pid: string, now: number, quit = false): void {
     const p = this.find(pid);
     if (!p) return;
+    const host = pid === this.host;
     p.connected = false;
     p.goneAt = now;
     this.pings.delete(pid);
-    if (quit || (this.inMatch && p.seat < 0)) this.drop(p);
+    // A host whose socket dropped keeps the match for HOST_GRACE_MS, even when they were only watching it.
+    if (quit || (this.inMatch && p.seat < 0 && !host)) this.drop(p);
+    if (quit && host && this.inMatch) {
+      this.passHost();
+      this.endMatch();
+    } else if (quit && this.inMatch && p.seat >= 0) {
+      this.io.send(this.host, { t: 'left', id: p.id });
+    }
     this.ensureHost();
     if (this.wipeIfEmpty()) return;
     if (this.phase === 'lobby') this.reseatLobby();
-    if (!this.inMatch || !this.checkWinner()) this.broadcastRoom();
+    this.broadcastRoom();
   }
 
-  /** Removes a player whose grace is spent. Seated players stay listed so their score is still shown. */
+  /** Removes a player whose grace is spent. Seated players stay listed during and after a match so their score is still shown. */
   private drop(p: Player): void {
     p.goneAt = -1;
-    if (this.inMatch && p.seat >= 0) this.knockOut(p);
-    else if (!(this.phase === 'over' && p.seat >= 0)) this.players = this.players.filter((q) => q !== p);
+    if (p.seat < 0 || this.phase === 'lobby') this.players = this.players.filter((q) => q !== p);
   }
 
   /** Forgets the whole party once no person is connected or about to come back. */
   private wipeIfEmpty(): boolean {
     if (this.players.some((q) => !q.bot && (q.connected || q.goneAt >= 0))) return false;
     this.players = [];
-    this.brains.clear();
     this.phase = 'lobby';
     this.resetForLobby();
     return true;
   }
 
-  /** Spends the grace of players who have not come back. Returns true if anything changed. */
+  /**
+   * When the match's host counts as gone: HOST_GRACE_MS after their socket dropped, or HOST_SILENT_MS after an open
+   * socket last showed life (a locked phone or frozen tab keeps its socket but stops running the match).
+   */
+  private hostGoneAt(): number {
+    const host = this.find(this.host);
+    if (!host || (!host.connected && host.goneAt < 0)) return -Infinity;
+    if (!host.connected) return host.goneAt + HOST_GRACE_MS;
+    return (this.io.seenAt(host.pid) ?? Infinity) + HOST_SILENT_MS;
+  }
+
+  /** Spends the grace of players who have not come back, and ends a match whose host is gone. Returns true if anything changed. */
   purge(now: number): boolean {
     let changed = false;
     for (const p of [...this.players]) {
-      if (p.connected || p.goneAt < 0) continue;
-      if (now - p.goneAt < (this.inMatch ? RECONNECT_GRACE_MS : LOBBY_GRACE_MS)) continue;
+      if (p.connected || p.goneAt < 0 || now - p.goneAt < LOBBY_GRACE_MS) continue;
       this.drop(p);
+      changed = true;
+    }
+    if (this.inMatch && now >= this.hostGoneAt()) {
+      this.passHost();
+      this.endMatch();
       changed = true;
     }
     if (!changed) return false;
     if (this.wipeIfEmpty()) return true;
     if (this.phase === 'lobby') this.reseatLobby();
     this.ensureHost();
-    if (!this.inMatch || !this.checkWinner()) this.broadcastRoom();
+    this.broadcastRoom();
     return true;
   }
 
   /** The earliest time purge() could change something, or null. */
   nextPurgeAt(): number | null {
-    const grace = this.inMatch ? RECONNECT_GRACE_MS : LOBBY_GRACE_MS;
-    const times = this.players.filter((p) => !p.connected && p.goneAt >= 0).map((p) => p.goneAt + grace);
-    return times.length ? Math.min(...times) : null;
-  }
-
-  /**
-   * Queues pointer samples, flattened oldest first as [x0, y0, x1, y1, ...] and numbered from `s`. tick() applies one per
-   * step and snapshots report the number of the last one applied.
-   */
-  input(pid: string, s: unknown, q: unknown): void {
-    const p = this.find(pid);
-    if (!this.world || !p || p.seat < 0 || p.out) return;
-    if (typeof s !== 'number' || !Number.isSafeInteger(s) || s < 0) return;
-    if (!Array.isArray(q) || q.length % 2 !== 0 || q.length > MAX_SAMPLES * 2 || !q.every(Number.isFinite)) return;
-    let inputs = this.inputs.get(pid);
-    if (!inputs) this.inputs.set(pid, (inputs = { queue: [], applied: -1, spare: Infinity, watched: 0 }));
-    const clamp = (n: number) => Math.max(-2, Math.min(2, n));
-    for (let i = 0; i < q.length; i += 2) {
-      inputs.queue.push({ x: clamp(q[i] as number), y: clamp(q[i + 1] as number), seq: s + i / 2 });
-    }
-    inputs.queue = inputs.queue.slice(-INPUT_QUEUE);
+    const times = this.players.filter((p) => !p.connected && p.goneAt >= 0).map((p) => p.goneAt + LOBBY_GRACE_MS);
+    if (this.inMatch) times.push(this.hostGoneAt());
+    const at = Math.min(...times);
+    return at === Infinity ? null : at;
   }
 
   /**
@@ -369,6 +388,7 @@ export class Room {
     this.broadcastRoom();
   }
 
+  /** Seats the connected players and opens match number `match`. The host's page runs it from here. */
   start(pid: string): void {
     if (pid !== this.host || this.phase !== 'lobby') return;
     if (this.players.filter((p) => p.connected).length < MIN_SEATS) {
@@ -379,20 +399,50 @@ export class Room {
     this.reseatLobby();
     const seated = this.players.filter((p) => p.seat >= 0);
     this.seats = seated.length;
-    const layout = makeLayout(this.seats, this.settings);
-    this.world = createWorld(layout, this.settings, this.io.random);
     for (const p of seated) {
       p.score = 0;
       p.lives = this.settings.target;
       p.out = false;
-      placeMallet(this.world, p.seat, homePosition(layout, p.seat, this.settings.zone));
+      p.linked = true;
     }
     this.winner = null;
-    this.lastConceded = -1;
-    this.inputs.clear();
-    this.spots.clear();
+    this.match++;
+    this.v = 0;
+    this.k = 0;
+    this.timer = COUNTDOWN_MS;
     this.phase = 'countdown';
-    this.timer = COUNTDOWN_TICKS;
+    this.broadcastRoom();
+  }
+
+  /**
+   * Mirrors the host's match state. Only the host's reports for the match in play count, and only newer ones, so the
+   * repeat a host page sends each time its socket opens is ignored.
+   */
+  report(pid: string, msg: MatchMsg): void {
+    if (pid !== this.host || !this.inMatch || msg.match !== this.match) return;
+    if (!Number.isSafeInteger(msg.v) || msg.v <= this.v || !REPORT_PHASES.includes(msg.phase)) return;
+    if (!Number.isFinite(msg.k) || !Number.isFinite(msg.timer)) return;
+    const seats: unknown = msg.seats;
+    if (!Array.isArray(seats) || seats.length !== this.seats || !seats.every(isSeatState)) return;
+    const seated = this.players.filter((p) => p.seat >= 0);
+    const winner = msg.winner === null ? null : seated.find((p) => p.id === msg.winner);
+    if (winner === undefined) return;
+    this.phase = msg.phase;
+    this.v = msg.v;
+    this.k = msg.k;
+    this.timer = msg.timer;
+    this.winner = winner?.pid ?? null;
+    for (const p of seated) {
+      const { score, lives, out, linked } = seats[p.seat];
+      Object.assign(p, { score, lives, out, linked });
+    }
+    this.broadcastRoom();
+  }
+
+  /** The host's page can't run the match the room thinks is in play (it reloaded), so the match ends. */
+  abort(pid: string, match: unknown): void {
+    if (pid !== this.host || !this.inMatch || match !== this.match) return;
+    this.endMatch();
     this.broadcastRoom();
   }
 
@@ -407,154 +457,5 @@ export class Room {
     this.resetForLobby();
     this.ensureHost();
     this.broadcastRoom();
-  }
-
-  /** One fixed physics step of 1/TICK_HZ seconds. `now` only drives the coarse reconnect grace. */
-  tick(now: number): void {
-    const world = this.world;
-    if (!world || !this.inMatch) return;
-    this.tickCount++;
-    this.purge(now);
-    if (!this.inMatch) return;
-    this.driveBots(world);
-    this.drivePeople(world);
-
-    if (this.phase === 'countdown' || this.phase === 'scored') {
-      this.timer--;
-      if (this.timer <= 0) {
-        serve(world, this.phase === 'scored' ? this.lastConceded : -1);
-        this.phase = 'playing';
-        this.broadcastRoom();
-      }
-    }
-
-    for (const e of step(world, 1 / TICK_HZ)) {
-      if (e.k === 'goal') {
-        if (this.phase === 'playing') this.goal(e.seat, e.x, e.y);
-      } else {
-        const seat = e.k === 'hit' ? e.seat : -1;
-        if (this.quiet(seat, e.x, e.y, e.k === 'hit')) continue;
-        this.pending.push([e.k === 'hit' ? 0 : 1, round(e.x), round(e.y), round(e.s), seat]);
-      }
-    }
-
-    if (this.inMatch && this.tickCount % SNAP_EVERY === 0) this.broadcastSnap();
-  }
-
-  /** True for an event clients shouldn't get: a repeat of a held contact, or a hit too soon after the seat's last one. */
-  private quiet(seat: number, x: number, y: number, hit: boolean): boolean {
-    const spots = (this.spots.get(seat) ?? []).filter((p) => this.tickCount - p.k < SAME_SPOT_TICKS);
-    this.spots.set(seat, spots);
-    const same = spots.find((p) => Math.hypot(x - p.x, y - p.y) < SAME_SPOT);
-    if (same) {
-      same.k = this.tickCount;
-      return true;
-    }
-    const last = spots.at(-1);
-    if (hit && last && this.tickCount - last.k < HIT_EVENT_GAP) return true;
-    spots.push({ k: this.tickCount, x, y });
-    if (spots.length > SPOTS_KEPT) spots.shift();
-    return false;
-  }
-
-  private driveBots(world: World): void {
-    for (const p of this.players) {
-      if (!p.bot || p.seat < 0 || p.out) continue;
-      let brain = this.brains.get(p.pid);
-      if (!brain) this.brains.set(p.pid, (brain = newBrain()));
-      const target = botTarget(world, p.seat, p.bot, brain, this.io.random, 1 / TICK_HZ);
-      if (target) setTarget(world, p.seat, target);
-    }
-  }
-
-  /** Moves each person's mallet to their next queued sample. With nothing queued it holds its last target. */
-  private drivePeople(world: World): void {
-    for (const p of this.players) {
-      const inputs = this.inputs.get(p.pid);
-      if (p.bot || p.seat < 0 || p.out || !inputs) continue;
-      if (inputs.watched >= DRAIN_TICKS) {
-        if (inputs.spare > 0) inputs.queue.shift();
-        inputs.spare = Infinity;
-        inputs.watched = 0;
-      }
-      const next = inputs.queue.shift();
-      if (next) {
-        setTarget(world, p.seat, next);
-        inputs.applied = next.seq;
-      }
-      inputs.spare = Math.min(inputs.spare, inputs.queue.length);
-      inputs.watched++;
-    }
-  }
-
-  private broadcastSnap(): void {
-    const world = this.world;
-    if (!world) return;
-    const { puck } = world;
-    const acks = world.mallets.map(() => -1);
-    for (const p of this.players) {
-      const applied = this.inputs.get(p.pid)?.applied;
-      if (p.seat >= 0 && applied !== undefined) acks[p.seat] = applied;
-    }
-    this.io.broadcast({
-      t: 's',
-      k: this.tickCount,
-      p: [round(puck.x), round(puck.y), round(puck.vx), round(puck.vy)],
-      m: world.mallets.map((m) => (m ? [round(m.x), round(m.y)] : 0)),
-      h: world.lastHitter,
-      e: this.pending,
-      a: acks,
-    });
-    this.pending = [];
-  }
-
-  private seatPlayer(seat: number): Player | undefined {
-    return this.players.find((p) => p.seat === seat);
-  }
-
-  private goal(seat: number, x: number, y: number): void {
-    const world = this.world;
-    if (!world) return;
-    const { scorer, kind } = resolveGoal(this.settings.mode, seat, world.touches);
-    const conceder = this.seatPlayer(seat);
-    if (kind === 'score') {
-      const p = this.seatPlayer(scorer);
-      if (p) p.score++;
-    }
-    if (kind === 'life' && conceder) {
-      conceder.lives = Math.max(0, conceder.lives - 1);
-      if (conceder.lives === 0) this.knockOut(conceder);
-    }
-    resetPuck(world);
-    this.lastConceded = seat;
-    this.io.broadcast({ t: 'goal', k: this.tickCount, seat, scorer, kind, x: round(x), y: round(y) });
-    if (!this.checkWinner()) {
-      this.phase = 'scored';
-      this.timer = SCORED_TICKS;
-      this.broadcastRoom();
-    }
-  }
-
-  private knockOut(p: Player): void {
-    p.out = true;
-    if (!this.world || p.seat < 0) return;
-    this.world.open[p.seat] = false;
-    this.world.mallets[p.seat] = null;
-    this.world.touches = this.world.touches.filter((s) => s !== p.seat);
-    if (this.world.lastHitter === p.seat) this.world.lastHitter = -1;
-  }
-
-  private checkWinner(): boolean {
-    const seated = this.players.filter((p) => p.seat >= 0);
-    const alive = seated.filter((p) => !p.out);
-    let winner: Player | undefined;
-    if (alive.length <= 1) winner = alive[0];
-    else if (this.settings.mode === 'points') winner = alive.find((p) => p.score >= this.settings.target);
-    if (!winner && alive.length > 1) return false;
-    this.winner = winner?.pid ?? null;
-    this.phase = 'over';
-    this.world = null;
-    this.broadcastRoom();
-    return true;
   }
 }

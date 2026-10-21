@@ -24,6 +24,19 @@ jobs:
       - run: npm test
       - run: npm run build
 
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      # Runs on the runner's own Google Chrome, so Playwright's browsers are never downloaded.
+      - run: npm run e2e
+
   secrets:
     runs-on: ubuntu-latest
     timeout-minutes: 5

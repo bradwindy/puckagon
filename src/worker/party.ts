@@ -1,43 +1,124 @@
 import { DurableObject } from 'cloudflare:workers';
-import { CLOSE, MAX_MESSAGE_BYTES, sanitizeName, TICK_HZ, type ClientMsg, type ServerMsg } from '../shared/protocol';
+import {
+  CLOSE,
+  MAX_MESSAGE_BYTES,
+  sanitizeName,
+  type ClientMsg,
+  type IceCandidate,
+  type IceServer,
+  type ServerMsg,
+  type SignalData,
+} from '../shared/protocol';
 import { MAX_PLAYERS, Room, type RoomSnapshot } from './room';
 
 interface Attachment {
   pid?: string;
   /** The ping the room last showed for this player, kept here so it survives hibernation without a storage write. */
   ping?: number;
-  /** Where the player reaches Cloudflare, for the match-start log. Null when the upgrade request did not say. */
-  colo?: string | null;
-  country?: string | null;
-  /** TCP round trip from the player to their colo in ms. */
-  rtt?: number | null;
 }
-
-/** Headers index.ts fills from Cloudflare's data about the player's connection before forwarding the upgrade. */
-export const NET_HEADERS = { colo: 'x-pk-colo', country: 'x-pk-country', rtt: 'x-pk-rtt' } as const;
 
 const attachment = (ws: WebSocket | undefined): Attachment => (ws?.deserializeAttachment() as Attachment | null) ?? {};
 
 const PID_RE = /^[A-Za-z0-9_-]{16,64}$/;
 const MAX_MESSAGES_PER_SECOND = 90;
+/** Signals get their own budget: a new host answering eleven guests sends far more than 90 a second for a moment. */
+const MAX_SIGNALS_PER_SECOND = 400;
 const SNAPSHOT_KEY = 'room';
-const STALL_MS = 1000;
-const MAX_CATCH_UP = 4;
+const STUN_ONLY: IceServer[] = [{ urls: 'stun:stun.cloudflare.com:3478' }];
+const TURN_TTL_S = 43200;
+/** A party hands every page the same TURN credential while more than half its life is left. */
+const TURN_REUSE_MS = (TURN_TTL_S * 1000) / 2;
+const TURN_TIMEOUT_MS = 3000;
+/** Browsers block port 53, so a URL on it only times out. */
+const PORT_53 = /:53(?:[/?]|$)/;
 
-/** One Durable Object per party code. Uses the WebSocket Hibernation API so an idle lobby costs nothing. */
-export class Party extends DurableObject<Env> {
+/** Keeps the well-formed servers of a TURN response and drops their port 53 URLs. */
+function usableIceServers(list: unknown): IceServer[] {
+  if (!Array.isArray(list)) return [];
+  const servers: IceServer[] = [];
+  for (const s of list) {
+    if (typeof s !== 'object' || s === null) continue;
+    const { urls, username, credential } = s as Record<string, unknown>;
+    const all: unknown[] = typeof urls === 'string' ? [urls] : Array.isArray(urls) ? urls : [];
+    const kept = all.filter((u): u is string => typeof u === 'string' && !PORT_53.test(u));
+    if (!kept.length) continue;
+    servers.push({
+      urls: kept,
+      ...(typeof username === 'string' && { username }),
+      ...(typeof credential === 'string' && { credential }),
+    });
+  }
+  return servers;
+}
+
+const optional = (v: unknown, type: 'string' | 'number') => v === undefined || v === null || typeof v === type;
+
+/** Rebuilds relayed signalling from its known fields, or returns null when it isn't an offer, answer or candidate. */
+function signalData(d: unknown): SignalData | null {
+  if (typeof d !== 'object' || d === null || Object.keys(d).length !== 1) return null;
+  if ('sdp' in d) {
+    const { type, sdp } = (d.sdp ?? {}) as Record<string, unknown>;
+    if ((type !== 'offer' && type !== 'answer') || typeof sdp !== 'string') return null;
+    return { sdp: { type, sdp } };
+  }
+  if (!('candidate' in d)) return null;
+  if (d.candidate === null) return { candidate: null };
+  const c = (d.candidate ?? {}) as Record<string, unknown>;
+  if (typeof c.candidate !== 'string' || !optional(c.sdpMid, 'string') || !optional(c.sdpMLineIndex, 'number')) return null;
+  if (!optional(c.usernameFragment, 'string')) return null;
+  const { candidate, sdpMid, sdpMLineIndex, usernameFragment } = c as IceCandidate;
+  return { candidate: { candidate, sdpMid, sdpMLineIndex, usernameFragment } };
+}
+
+/**
+ * Optional Worker secrets for Cloudflare TURN. Local dev and previews run without them and hand out STUN only, so
+ * guests behind strict NATs can't connect there.
+ */
+export interface TurnSecrets {
+  TURN_KEY_ID?: string;
+  TURN_KEY_API_TOKEN?: string;
+}
+
+/**
+ * STUN and TURN servers for a party's pages. With the TURN key set they include a short-lived Cloudflare TURN
+ * credential. Without it, or when Cloudflare doesn't answer in time, pages get Cloudflare STUN alone.
+ */
+export async function iceServers(env: TurnSecrets): Promise<IceServer[]> {
+  const { TURN_KEY_ID: keyId, TURN_KEY_API_TOKEN: token } = env;
+  if (!keyId || !token) return STUN_ONLY;
+  try {
+    const res = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${keyId}/credentials/generate-ice-servers`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ttl: TURN_TTL_S }),
+      signal: AbortSignal.timeout(TURN_TIMEOUT_MS),
+    });
+    if (!res.ok) throw new Error(`TURN credentials request returned ${res.status}`);
+    const servers = usableIceServers(((await res.json()) as { iceServers?: unknown } | null)?.iceServers);
+    if (!servers.length) throw new Error('TURN credentials response had no usable servers');
+    return servers;
+  } catch (err) {
+    console.error(JSON.stringify({ event: 'turn_failed', error: String(err) }));
+    return STUN_ONLY;
+  }
+}
+
+/**
+ * One Durable Object per party code. It runs the lobby, relays WebRTC signalling between the host's page and its
+ * guests, and mirrors the match state the host reports. Uses the WebSocket Hibernation API so an idle lobby costs nothing.
+ */
+export class Party extends DurableObject<Env & TurnSecrets> {
   private room: Room;
   private sockets = new Map<string, WebSocket>();
-  private loop: ReturnType<typeof setTimeout> | null = null;
-  private loopStart = 0;
-  private ticksRun = 0;
   private purgeTimer: ReturnType<typeof setTimeout> | null = null;
-  private lastTickAt = 0;
-  private budget = new WeakMap<WebSocket, { second: number; count: number }>();
+  private purgeAt = 0;
+  private budget = new WeakMap<WebSocket, { second: number; messages: number; signals: number }>();
+  private helloAt = new WeakMap<WebSocket, number>();
+  private ice: { servers: Promise<IceServer[]>; at: number } | null = null;
+  private wokeAt = Date.now();
   private saved = '';
-  private colo: Promise<string | null> | null = null;
 
-  constructor(ctx: DurableObjectState, env: Env) {
+  constructor(ctx: DurableObjectState, env: Env & TurnSecrets) {
     super(ctx, env);
     this.room = new Room({
       send: (pid, msg) => this.send(this.sockets.get(pid), msg),
@@ -45,8 +126,8 @@ export class Party extends DurableObject<Env> {
         const data = JSON.stringify(msg);
         for (const ws of this.sockets.values()) this.sendRaw(ws, data);
       },
-      random: Math.random,
       newId: () => crypto.randomUUID().slice(0, 8),
+      seenAt: (pid) => this.seenAt(pid),
     });
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair('ping', 'pong'));
 
@@ -70,25 +151,22 @@ export class Party extends DurableObject<Env> {
     }
     const { 0: client, 1: server } = new WebSocketPair();
     this.ctx.acceptWebSocket(server);
-    const rtt = request.headers.get(NET_HEADERS.rtt);
-    server.serializeAttachment({
-      colo: request.headers.get(NET_HEADERS.colo),
-      country: request.headers.get(NET_HEADERS.country),
-      rtt: rtt === null ? null : Number(rtt),
-    } satisfies Attachment);
     return new Response(null, { status: 101, webSocket: client });
   }
 
   async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {
-    if (typeof message !== 'string' || message.length > MAX_MESSAGE_BYTES || !this.allow(ws)) return;
-    let msg: ClientMsg;
+    if (typeof message !== 'string' || message.length > MAX_MESSAGE_BYTES) return;
+    // Pages put `t` first, so the budget is picked and spent before a flood costs a parse.
+    const signal = message.startsWith('{"t":"signal"');
+    if (!this.allow(ws, signal)) return;
+    let msg: ClientMsg | null;
     try {
-      msg = JSON.parse(message) as ClientMsg;
+      msg = JSON.parse(message) as ClientMsg | null;
     } catch {
       return;
     }
-    if (typeof msg !== 'object' || msg === null) return;
-    this.watchdog();
+    // A repeated key could dress up another message as a signal to spend the bigger budget.
+    if (typeof msg !== 'object' || msg === null || signal !== (msg.t === 'signal')) return;
     const att = attachment(ws);
     const pid = att.pid;
 
@@ -101,31 +179,43 @@ export class Party extends DurableObject<Env> {
       const previous = this.sockets.get(msg.pid);
       ws.serializeAttachment({ ...att, pid: msg.pid } satisfies Attachment);
       this.sockets.set(msg.pid, ws);
+      this.helloAt.set(ws, Date.now());
       if (previous && previous !== ws) this.closeQuietly(previous, CLOSE.replaced, 'Replaced by a newer connection');
       this.room.join(msg.pid, sanitizeName(msg.name) || 'Player');
       await this.afterChange();
+      // Other messages from this socket are handled while the TURN request is out.
+      this.send(ws, { t: 'ice', servers: await this.sharedIceServers() });
       return;
     }
     if (!pid || this.sockets.get(pid) !== ws) return;
 
     switch (msg.t) {
-      case 'p':
-        this.room.input(pid, msg.s, msg.q);
-        return;
       case 'rtt': {
         const ping = this.room.reportPing(pid, msg.ms);
         if (ping !== null) ws.serializeAttachment({ ...att, ping } satisfies Attachment);
         return;
       }
+      case 'signal': {
+        const from = this.room.idOf(pid);
+        const to = this.room.peer(pid, msg.to);
+        const d = signalData(msg.d);
+        if (from && to && d && Number.isSafeInteger(msg.l)) {
+          this.send(this.sockets.get(to.pid), { t: 'signal', from, l: msg.l, d });
+        }
+        return;
+      }
       case 'settings':
         this.room.updateSettings(pid, msg.s);
         break;
-      case 'start': {
-        const inLobby = this.room.phase === 'lobby';
+      case 'start':
         this.room.start(pid);
-        if (inLobby && this.room.inMatch) this.logMatchStart();
         break;
-      }
+      case 'match':
+        this.room.report(pid, msg);
+        break;
+      case 'abort':
+        this.room.abort(pid, msg.match);
+        break;
       case 'again':
         this.room.again(pid);
         break;
@@ -160,21 +250,39 @@ export class Party extends DurableObject<Env> {
     await this.afterChange();
   }
 
-  private allow(ws: WebSocket): boolean {
-    const second = Math.floor(Date.now() / 1000);
-    const b = this.budget.get(ws);
-    if (!b || b.second !== second) {
-      this.budget.set(ws, { second, count: 1 });
-      return true;
-    }
-    b.count++;
-    return b.count <= MAX_MESSAGES_PER_SECOND;
+  /**
+   * When the player's socket last showed life: its last automatic pong, or else when it said hello or when this object
+   * woke, whichever is later. Null when they have no socket.
+   */
+  private seenAt(pid: string): number | null {
+    const ws = this.sockets.get(pid);
+    if (!ws) return null;
+    const pong = this.ctx.getWebSocketAutoResponseTimestamp(ws)?.getTime() ?? -Infinity;
+    return Math.max(pong, this.helloAt.get(ws) ?? this.wokeAt);
   }
 
-  /** Persists lobby-level state and starts or stops the timers. Never runs inside a tick. */
+  private allow(ws: WebSocket, signal: boolean): boolean {
+    const second = Math.floor(Date.now() / 1000);
+    let b = this.budget.get(ws);
+    if (!b || b.second !== second) this.budget.set(ws, (b = { second, messages: 0, signals: 0 }));
+    return signal ? ++b.signals <= MAX_SIGNALS_PER_SECOND : ++b.messages <= MAX_MESSAGES_PER_SECOND;
+  }
+
+  /** The party's ice servers, made once for every page until TURN_REUSE_MS. A failed TURN request isn't kept. */
+  private sharedIceServers(): Promise<IceServer[]> {
+    const now = Date.now();
+    if (this.ice && now - this.ice.at < TURN_REUSE_MS) return this.ice.servers;
+    const ice = { servers: iceServers(this.env), at: now };
+    this.ice = ice;
+    void ice.servers.then((servers) => {
+      if (servers === STUN_ONLY && this.ice === ice) this.ice = null;
+    });
+    return ice.servers;
+  }
+
+  /** Persists the lobby and arms the purge timer. */
   private async afterChange(): Promise<void> {
     if (this.room.players.length === 0) {
-      this.stopLoop();
       this.clearPurge();
       this.saved = '';
       await this.ctx.storage.deleteAll();
@@ -186,19 +294,22 @@ export class Party extends DurableObject<Env> {
       this.ctx.storage.kv.put(SNAPSHOT_KEY, this.room.snapshot());
       this.saved = json;
     }
-    if (this.room.inMatch) {
-      this.clearPurge();
-      this.startLoop();
-    } else {
-      this.stopLoop();
-      this.schedulePurge();
-    }
+    this.schedulePurge();
   }
 
-  /** Outside a match there is no tick, so a one-shot timer ends the reconnect grace of anyone who left. */
+  /**
+   * A one-shot timer ends reconnect graces and a match whose host is gone. Graces differ in length, so a new deadline
+   * earlier than the armed one re-arms it.
+   */
   private schedulePurge(): void {
     const at = this.room.nextPurgeAt();
-    if (this.purgeTimer || at === null) return;
+    if (at === null) {
+      this.clearPurge();
+      return;
+    }
+    if (this.purgeTimer && this.purgeAt <= at) return;
+    this.clearPurge();
+    this.purgeAt = at;
     this.purgeTimer = setTimeout(
       () => {
         this.purgeTimer = null;
@@ -213,76 +324,6 @@ export class Party extends DurableObject<Env> {
     if (!this.purgeTimer) return;
     clearTimeout(this.purgeTimer);
     this.purgeTimer = null;
-  }
-
-  private startLoop(): void {
-    if (this.loop) return;
-    this.lastTickAt = this.loopStart = Date.now();
-    this.ticksRun = 0;
-    this.scheduleTicks();
-  }
-
-  /** Aims each timer at the next tick boundary, so ticks follow the wall clock however the runtime rounds delays. */
-  private scheduleTicks(): void {
-    const next = this.loopStart + ((this.ticksRun + 1) * 1000) / TICK_HZ;
-    this.loop = setTimeout(() => this.runTicks(), Math.max(0, Math.ceil(next - Date.now())));
-  }
-
-  private runTicks(): void {
-    const now = Date.now();
-    this.lastTickAt = now;
-    const due = Math.floor(((now - this.loopStart) * TICK_HZ) / 1000);
-    this.ticksRun = Math.max(this.ticksRun, due - MAX_CATCH_UP);
-    try {
-      while (this.ticksRun < due && this.room.inMatch) {
-        this.ticksRun++;
-        this.room.tick(now);
-      }
-    } catch (err) {
-      console.error(JSON.stringify({ event: 'tick_failed', error: String(err) }));
-    }
-    if (this.room.inMatch) {
-      this.scheduleTicks();
-      return;
-    }
-    this.loop = null;
-    this.afterChange().catch((err) => console.error(JSON.stringify({ event: 'match_end_failed', error: String(err) })));
-  }
-
-  private stopLoop(): void {
-    if (!this.loop) return;
-    clearTimeout(this.loop);
-    this.loop = null;
-  }
-
-  /** The runtime can stop running the tick timer when the object runs out of CPU budget. Restart it if ticks have stalled. */
-  private watchdog(): void {
-    if (this.loop && this.room.inMatch && Date.now() - this.lastTickAt > STALL_MS) {
-      console.warn(JSON.stringify({ event: 'tick_stall_restart', stalledMs: Date.now() - this.lastTickAt }));
-      this.stopLoop();
-      this.startLoop();
-    }
-  }
-
-  /** Logs where the seated players and this object connect from, to tell whether placing matches nearer players would pay. */
-  private logMatchStart(): void {
-    const seats = this.room.seats;
-    const players = this.room.players
-      .filter((p) => p.seat >= 0)
-      .map((p) => {
-        const att = attachment(this.sockets.get(p.pid));
-        return { bot: p.bot !== null, colo: att.colo ?? null, country: att.country ?? null, rtt: att.rtt ?? null };
-      });
-    void this.serverColo().then((server) => console.log(JSON.stringify({ event: 'match_start', seats, players, server })));
-  }
-
-  /** The colo this object runs in, looked up once per instance. Null when the lookup fails. */
-  private serverColo(): Promise<string | null> {
-    this.colo ??= fetch('https://www.cloudflare.com/cdn-cgi/trace', { signal: AbortSignal.timeout(2000) })
-      .then((res) => res.text())
-      .then((text) => /^colo=(\w+)$/m.exec(text)?.[1] ?? null)
-      .catch(() => null);
-    return this.colo;
   }
 
   private closeQuietly(ws: WebSocket, code: number, reason: string): void {

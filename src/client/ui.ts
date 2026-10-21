@@ -88,6 +88,12 @@ export class UI {
   private bar: HTMLElement | null = null;
   private panel: HTMLElement | null = null;
   private toast: HTMLElement | null = null;
+  /** What the toast shows, by priority: the socket's state, then what a guest waits on, then the latest flash. */
+  private status: NetStatus = 'connecting';
+  private waiting = '';
+  private flashText = '';
+  private flashTimer = 0;
+  private toastKey = '';
   private ping: HTMLElement | null = null;
   private pingKey = '';
   private code = '';
@@ -108,7 +114,9 @@ export class UI {
   private clear(): void {
     this.root.replaceChildren();
     this.screen = this.bar = this.panel = this.toast = this.ping = null;
-    this.lastPanelKey = this.pingKey = '';
+    this.lastPanelKey = this.pingKey = this.toastKey = this.waiting = this.flashText = '';
+    this.status = 'connecting';
+    clearTimeout(this.flashTimer);
   }
 
   private nameInput(name: string): HTMLInputElement {
@@ -261,10 +269,42 @@ export class UI {
 
   flash(text: string, ms = 1800): void {
     if (!this.toast) return;
-    this.toast.textContent = text;
-    this.toast.classList.remove('hidden');
-    clearTimeout((this.toast as unknown as { t?: number }).t);
-    (this.toast as unknown as { t?: number }).t = window.setTimeout(() => this.toast?.classList.add('hidden'), ms);
+    this.flashText = text;
+    clearTimeout(this.flashTimer);
+    this.flashTimer = window.setTimeout(() => {
+      this.flashText = '';
+      this.showToast();
+    }, ms);
+    this.showToast();
+  }
+
+  /** What a guest is waiting on in a match, or '' for nothing. Called every frame. */
+  setWaiting(text: string): void {
+    if (text === this.waiting) return;
+    this.waiting = text;
+    this.showToast();
+  }
+
+  private showToast(): void {
+    const toast = this.toast;
+    if (!toast) return;
+    const status = this.status;
+    const text =
+      status === 'connecting'
+        ? 'Connecting…'
+        : status === 'reconnecting'
+          ? 'Reconnecting…'
+          : status === 'replaced'
+            ? 'This party is open in another tab.'
+            : status === 'outdated'
+              ? 'Puckagon was updated. '
+              : this.waiting || this.flashText;
+    if (text === this.toastKey) return;
+    this.toastKey = text;
+    toast.classList.toggle('hidden', !text);
+    toast.classList.toggle('action', status === 'outdated');
+    if (status === 'outdated') toast.replaceChildren(text, h('button', { class: 'btn icon', onclick: () => location.reload() }, 'Reload'));
+    else toast.textContent = text;
   }
 
   /** Shows your ping in the top bar, or hides it while unknown. */
@@ -274,7 +314,7 @@ export class UI {
     this.pingKey = key;
     this.ping.className = unstable ? 'ping ping-bad unstable' : ms < 0 ? 'ping hidden' : `ping ping-${pingLevel(ms)}`;
     this.ping.textContent = unstable ? 'unstable' : `${ms} ms`;
-    this.ping.title = unstable ? 'The game is arriving unevenly, so the puck may stutter' : 'Your ping to the party';
+    this.ping.title = unstable ? 'The game is arriving unevenly, so the puck may stutter' : 'Your ping to the host';
   }
 
   /** Area of the window the table should fit in, given what overlays are showing. */
@@ -300,22 +340,8 @@ export class UI {
 
   update(state: GameState, status: NetStatus): void {
     if (!this.panel || !this.toast) return;
-    if (status === 'reconnecting' || status === 'connecting') {
-      this.toast.textContent = status === 'connecting' ? 'Connecting…' : 'Reconnecting…';
-      this.toast.classList.remove('hidden');
-    } else if (status === 'replaced') {
-      this.toast.textContent = 'This party is open in another tab.';
-      this.toast.classList.remove('hidden');
-    } else if (status === 'outdated') {
-      this.toast.replaceChildren(
-        'Puckagon was updated. ',
-        h('button', { class: 'btn icon', onclick: () => location.reload() }, 'Reload'),
-      );
-      this.toast.classList.add('action');
-      this.toast.classList.remove('hidden');
-    } else if (this.toast.textContent?.endsWith('…')) {
-      this.toast.classList.add('hidden');
-    }
+    this.status = status;
+    this.showToast();
 
     const room = state.room;
     if (!room) return;

@@ -17,7 +17,7 @@ let nextSeq = 0;
 
 /**
  * Samples the mallet at SAMPLE_HZ whatever the display rate, and batches the samples to send at INPUT_HZ. Every sample
- * is sent, even while the mallet is still, because prediction counts the samples the server has still to apply.
+ * is sent, even while the mallet is still, because prediction counts the samples the host has still to apply.
  */
 export class InputSampler {
   /** Samples not yet sent, oldest first. */
@@ -27,8 +27,12 @@ export class InputSampler {
   private nextSampleAt = 0;
   private last: { at: number; x: number; y: number } | null = null;
 
-  /** Takes the mallet position at `now`, from a frame or a pointer event, and returns the batch to send once one is ready. */
-  sample(now: number, mallet: Vec): { s: number; q: number[] } | null {
+  /**
+   * Takes the mallet position at `now`, from a frame or a pointer event, and returns the batch to send once there are
+   * new samples. With the newest `ack` seen, the batch also repeats the sent samples above it, the newest MAX_SAMPLES
+   * in all, so a lost message costs nothing.
+   */
+  sample(now: number, mallet: Vec, ack?: number): { s: number; q: number[] } | null {
     if (now - this.nextSampleAt > RESET_MS) {
       this.nextSampleAt = now;
       this.pending = [];
@@ -45,15 +49,22 @@ export class InputSampler {
     }
     this.last = { at: now, x: mallet.x, y: mallet.y };
     if (this.pending.length < SAMPLES_PER_SEND) return null;
-    const batch = this.pending.slice(-MAX_SAMPLES);
+    const fresh = this.pending.slice(-MAX_SAMPLES);
     this.pending = [];
-    this.history.push(...batch);
+    const batch = [...fresh];
+    // A batch numbers its samples from `s` on, so only an unbroken run of older ones can go with it.
+    for (let i = this.history.length - 1; ack !== undefined && i >= 0 && batch.length < MAX_SAMPLES; i--) {
+      const p = this.history[i];
+      if (p.seq <= ack || p.seq !== batch[0].seq - 1) break;
+      batch.unshift(p);
+    }
+    this.history.push(...fresh);
     if (this.history.length > HISTORY) this.history.splice(0, this.history.length - HISTORY);
     return { s: batch[0].seq, q: batch.flatMap((p) => [p.x, p.y]) };
   }
 
   /**
-   * The sample the server applied last, if it is still known, and the samples it has still to apply, oldest first.
+   * The sample the host applied last, if it is still known, and the samples it has still to apply, oldest first.
    * Those include the ones not sent yet, since they go out with the next batch.
    */
   since(ack: number): { applied: Sample | null; next: Sample[] } {
@@ -67,7 +78,7 @@ export class InputSampler {
     this.history = [];
   }
 
-  /** Forgets the samples before the one the server applied last. */
+  /** Forgets the samples before the one the host applied last. */
   prune(ack: number): void {
     const keep = this.history.findIndex((p) => p.seq >= ack);
     this.history.splice(0, keep < 0 ? this.history.length : keep);

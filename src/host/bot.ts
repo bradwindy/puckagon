@@ -24,8 +24,6 @@ export const BOT_SKILL: Record<BotLevel, Skill> = {
   hard: { speed: 4.6, react: 2, noise: 0.012, lead: 0.12, aimError: 0.08, keep: 1 },
 };
 
-export const BOT_NAMES = ['Robo', 'Bleep', 'Sparky', 'Gizmo', 'Turbo', 'Pixel', 'Widget', 'Nibbles', 'Chip', 'Zap', 'Bolt', 'Dot'];
-
 export interface BotBrain {
   aim: Vec;
   wait: number;

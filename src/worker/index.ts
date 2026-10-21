@@ -1,5 +1,4 @@
 import { CLOSE, normalizeCode, PROTOCOL_VERSION } from '../shared/protocol';
-import { NET_HEADERS } from './party';
 
 export { Party } from './party';
 
@@ -28,20 +27,6 @@ function outdated(): Response {
   return new Response(null, { status: 101, webSocket: client });
 }
 
-/**
- * Copies the player's colo, country and TCP round trip from Cloudflare's request data onto the upgrade for the party.
- * Headers the client sent under the same names are replaced or removed, so they can't be spoofed.
- */
-function withNetwork(request: Request<unknown, IncomingRequestCfProperties>): Request {
-  const headers = new Headers(request.headers);
-  const copy = (name: string, value: string | number | undefined) =>
-    value === undefined ? headers.delete(name) : headers.set(name, String(value));
-  copy(NET_HEADERS.colo, request.cf?.colo);
-  copy(NET_HEADERS.country, request.cf?.country);
-  copy(NET_HEADERS.rtt, request.cf?.clientTcpRtt);
-  return new Request(request, { headers });
-}
-
 export default {
   async fetch(request, env): Promise<Response> {
     const url = new URL(request.url);
@@ -58,7 +43,7 @@ export default {
     if (url.searchParams.get('v') !== String(PROTOCOL_VERSION)) return outdated();
 
     try {
-      return await env.PARTY.getByName(code).fetch(withNetwork(request));
+      return await env.PARTY.getByName(code).fetch(request);
     } catch (err) {
       console.error(JSON.stringify({ event: 'party_fetch_failed', code, error: String(err) }));
       return text('The party is busy. Try again in a moment.', 503);

@@ -7,20 +7,20 @@ import type { InputSampler } from './input';
 import type { Predictor, Snap } from './state';
 
 const DT = 1 / TICK_HZ;
-/** With more of your samples than this still to apply, the server is not keeping up with them, so prediction stops. */
+/** With more of your samples than this still to apply, the host is not keeping up with them, so prediction stops. */
 const MAX_UNACKED = 30;
 /** A partial step shorter than this, as a share of a tick, is skipped. */
 const MIN_FRAC = 1e-3;
 /**
  * Ticks predicted past local time with the pointer held, so the puck can keep moving when local time steps back a
- * tick, as it does when the server drops a queued sample.
+ * tick, as it does when the host drops a queued sample.
  */
 const EXTRA_TICKS = 2;
 /** Other mallets are guessed to keep moving as they last did, slowing with this time constant in ticks. */
 const GUESS_TICKS = 3;
 
 export interface PuckState {
-  /** Server tick, fractional for the partial step at the end. */
+  /** Host tick, fractional for the partial step at the end. */
   t: number;
   x: number;
   y: number;
@@ -33,11 +33,11 @@ export interface Prediction {
   seat: number;
   /** Tick of the snapshot it starts from. */
   k: number;
-  /** Local time: the tick your current pointer will reach the server. */
+  /** Local time: the tick your current pointer will reach the host. */
   L: number;
   /** Puck states from tick k to a little past L. Empty when the puck is not in play. */
   puck: PuckState[];
-  /** Predicted events as the server would send them, each at the tick it falls in. */
+  /** Predicted events as the host would send them, each at the tick it falls in. */
   events: { k: number; e: WireEvent }[];
   /** Tick of a predicted goal, or Infinity. */
   goal: number;
@@ -58,7 +58,7 @@ export interface PredictInput {
   snap: Snap;
   /** Whether the puck is in play at the snapshot. Otherwise only your mallet moves. */
   live: boolean;
-  /** The sample the server applied at the snapshot, which is still your mallet's target, or null when unknown. */
+  /** The sample the host applied at the snapshot, which is still your mallet's target, or null when unknown. */
   applied: Vec | null;
   /** Your samples after it, oldest first, one per tick. */
   next: Vec[];
@@ -72,7 +72,7 @@ function wire(e: Exclude<SimEvent, { k: 'goal' }>): WireEvent {
 }
 
 /**
- * Runs the server's physics forward from a snapshot with your own samples, one per tick, then a partial tick toward the
+ * Runs the host's physics forward from a snapshot with your own samples, one per tick, then a partial tick toward the
  * pointer. Other mallets carry on as they were moving at the snapshot, slowing to a stop.
  */
 export function predict(input: PredictInput): Prediction | null {
@@ -127,7 +127,7 @@ export function predict(input: PredictInput): Prediction | null {
   return out;
 }
 
-/** Predicts for `seat` from any snapshot, with the samples the server had still to apply at it and the pointer now. */
+/** Predicts for `seat` from any snapshot, with the samples the host had still to apply at it and the pointer now. */
 export function predictor(
   input: InputSampler,
   now: number,

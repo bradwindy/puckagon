@@ -1,32 +1,42 @@
 import { describe, expect, it } from 'vitest';
 import { predict, type Prediction, type PuckState } from '../src/client/predict';
 import { GameState, type Predictor, type Snap } from '../src/client/state';
+import { Match } from '../src/host/match';
 import { makeLayout } from '../src/shared/geometry';
-import { TICK_HZ, type RoomMsg, type ServerMsg, type SnapMsg, type WireEvent } from '../src/shared/protocol';
+import { TICK_HZ, type HostMsg, type RoomMsg, type SnapMsg, type WireEvent } from '../src/shared/protocol';
 import { DEFAULT_SETTINGS } from '../src/shared/settings';
-import { Room } from '../src/worker/room';
 
 const TICK_MS = 1000 / TICK_HZ;
 const LATENCY_MS = 50;
 
 describe('predict', () => {
-  it('matches the server tick for tick when it gets the same samples', () => {
-    const sent: ServerMsg[] = [];
-    let ids = 0;
-    const room = new Room({ send: () => {}, broadcast: (m) => sent.push(m), random: () => 0.5, newId: () => `id${ids++}` });
-    room.join('pid-0', 'Me');
-    room.join('pid-1', 'You');
-    room.start('pid-0');
+  it('matches the host tick for tick when it gets the same samples', () => {
+    const sent: HostMsg[] = [];
+    const match = new Match(
+      { send: (m) => sent.push(m), report: () => {}, random: () => 0.5 },
+      {
+        match: 1,
+        settings: DEFAULT_SETTINGS,
+        seats: 2,
+        players: [
+          { id: 'me', seat: 0, bot: null },
+          { id: 'you', seat: 1, bot: null },
+        ],
+        host: 'me',
+        linked: ['you'],
+      },
+      0,
+    );
     let now = 0;
-    const tick = () => room.tick((now += TICK_MS));
-    while (room.phase !== 'playing') tick();
-    const world = room.world!;
+    const tick = () => match.tick((now += TICK_MS));
+    while (match.phase !== 'playing') tick();
+    const world = match.world!;
     const home = { x: world.mallets[0]!.x, y: world.mallets[0]!.y };
     world.puck = { x: 0.3, y: 0.15, vx: -0.9, vy: 1.6 };
-    room.input('pid-0', 0, [home.x, home.y]);
+    match.input('me', 0, [home.x, home.y]);
     tick();
     const snap = sent.filter((m): m is SnapMsg => m.t === 's').at(-1)!;
-    const { puck, mallets } = room.world!;
+    const { puck, mallets } = match.world!;
     const exact: Snap = {
       k: snap.k,
       puck: [puck.x, puck.y, puck.vx, puck.vy],
@@ -38,8 +48,8 @@ describe('predict', () => {
     // A swing up into the puck's path.
     const swing = Array.from({ length: 20 }, (_, i) => ({ x: home.x + 0.12 - i * 0.004, y: home.y - i * 0.03 }));
     const pred = predict({
-      layout: room.world!.layout,
-      settings: room.settings,
+      layout: match.world!.layout,
+      settings: match.settings,
       seat: 0,
       open: [true, true],
       snap: exact,
@@ -49,16 +59,16 @@ describe('predict', () => {
       pointer: swing.at(-1)!,
       frac: 0,
     })!;
-    const server: number[][] = [];
+    const host: number[][] = [];
     swing.forEach((p, i) => {
-      room.input('pid-0', i + 1, [p.x, p.y]);
+      match.input('me', i + 1, [p.x, p.y]);
       tick();
-      const q = room.world!.puck;
-      server.push([q.x, q.y, q.vx, q.vy]);
+      const q = match.world!.puck;
+      host.push([q.x, q.y, q.vx, q.vy]);
     });
     expect(snap.a[0]).toBe(0);
     expect(pred.events.some(({ e }) => e[0] === 0 && e[4] === 0)).toBe(true);
-    expect(pred.puck.slice(1, swing.length + 1).map((s) => [s.x, s.y, s.vx, s.vy])).toEqual(server);
+    expect(pred.puck.slice(1, swing.length + 1).map((s) => [s.x, s.y, s.vx, s.vy])).toEqual(host);
   });
 
   it('guesses other mallets carry on as they last moved, slowing to a stop', () => {
@@ -84,14 +94,26 @@ describe('predict', () => {
   });
 });
 
-const ROOM: RoomMsg = { t: 'room', phase: 'playing', host: '', settings: DEFAULT_SETTINGS, players: [], seats: 2, timer: 0, winner: null };
+const ROOM: RoomMsg = {
+  t: 'room',
+  phase: 'playing',
+  host: '',
+  settings: DEFAULT_SETTINGS,
+  players: [],
+  seats: 2,
+  timer: 0,
+  winner: null,
+  match: 1,
+  v: 2,
+  k: 0,
+};
 /** Units per second along x, so the drawn puck's x tells the tick it is drawn at. */
 const SPEED = 1;
 const xAt = (t: number) => (SPEED * t) / TICK_HZ;
 const state = (t: number): PuckState => ({ t, x: xAt(t), y: 0, vx: SPEED, vy: 0, hitter: -1 });
 
-function snap(k: number, e: WireEvent[] = []): SnapMsg {
-  return { t: 's', k, p: [xAt(k), 0, SPEED, 0], m: [[0, 0.7], [0, -0.7]], h: -1, e, a: [k, -1] };
+function snap(k: number): SnapMsg {
+  return { t: 's', n: ROOM.match, k, p: [xAt(k), 0, SPEED, 0], m: [[0, 0.7], [0, -0.7]], h: -1, a: [k, -1] };
 }
 
 /** A prediction along the same line as the snapshots, `lead` ticks ahead. */
@@ -113,9 +135,9 @@ interface Frame {
 }
 
 /**
- * Plays ticks [from, to): each snapshot arrives LATENCY_MS after its tick, with `events(k)`, and a frame is drawn every
- * tick with a predictor that runs `lead(k)` ticks ahead of the newest snapshot while `predicting(k)`, and predicts
- * `guesses(k)`.
+ * Plays ticks [from, to): each snapshot, then its tick's `events(k)`, arrives LATENCY_MS after its tick, and a frame is
+ * drawn every tick with a predictor that runs `lead(k)` ticks ahead of the newest snapshot while `predicting(k)`, and
+ * predicts `guesses(k)`.
  */
 function play(
   st: GameState,
@@ -131,7 +153,11 @@ function play(
   const frames: Frame[] = [];
   let next = from;
   for (let now = from * TICK_MS + LATENCY_MS + 1; now < to * TICK_MS + LATENCY_MS; now += TICK_MS) {
-    for (; next < to && next * TICK_MS + LATENCY_MS <= now; next++) st.onSnap(snap(next, opts.events?.(next)), next * TICK_MS + LATENCY_MS);
+    for (; next < to && next * TICK_MS + LATENCY_MS <= now; next++) {
+      st.onSnap(snap(next), next * TICK_MS + LATENCY_MS);
+      const e = opts.events?.(next) ?? [];
+      if (e.length) st.onEvents({ t: 'e', n: ROOM.match, k: next, e });
+    }
     const predictor: Predictor = (s) => (opts.predicting(s.k) ? line(s, opts.lead(s.k), opts.guesses?.(s.k)) : null);
     const v = st.view(now, predictor);
     const events = v.due.flatMap((d) => (d.kind === 'event' ? [d.e] : []));
