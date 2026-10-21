@@ -1,8 +1,8 @@
-import { insideConvex, type Layout } from '../shared/geometry';
-import { createWorld, MALLET_MAX_SPEED, setTarget, step, type SimEvent, type World } from '../shared/physics';
+import type { Layout } from '../shared/geometry';
+import { createWorld, setTarget, step, type SimEvent } from '../shared/physics';
 import { round, TICK_HZ, type WireEvent } from '../shared/protocol';
 import type { Settings } from '../shared/settings';
-import { closestOnSegment, type Vec } from '../shared/vec';
+import type { Vec } from '../shared/vec';
 import type { InputSampler } from './input';
 import type { Predictor, Snap } from './state';
 
@@ -16,6 +16,8 @@ const MIN_FRAC = 1e-3;
  * tick, as it does when the server drops a queued sample.
  */
 const EXTRA_TICKS = 2;
+/** Other mallets are guessed to keep moving as they last did, slowing with this time constant in ticks. */
+const GUESS_TICKS = 3;
 
 export interface PuckState {
   /** Server tick, fractional for the partial step at the end. */
@@ -35,14 +37,14 @@ export interface Prediction {
   L: number;
   /** Puck states from tick k to a little past L. Empty when the puck is not in play. */
   puck: PuckState[];
-  /** By puck state, how far the puck is outside every other mallet's reach, in table units. Negative is inside it. */
-  clear: number[];
   /** Predicted events as the server would send them, each at the tick it falls in. */
   events: { k: number; e: WireEvent }[];
   /** Tick of a predicted goal, or Infinity. */
   goal: number;
   /** Your mallet at L. */
   mallet: Vec;
+  /** Every mallet at L, by seat. */
+  mallets: (Vec | null)[];
 }
 
 export interface PredictInput {
@@ -67,36 +69,9 @@ function wire(e: Exclude<SimEvent, { k: 'goal' }>): WireEvent {
   return e.k === 'hit' ? [0, round(e.x), round(e.y), round(e.s), e.seat] : [1, round(e.x), round(e.y), round(e.s), -1];
 }
 
-function distToConvex(p: Vec, poly: Vec[]): number {
-  if (insideConvex(p, poly)) return 0;
-  let best = Infinity;
-  for (let i = 0; i < poly.length; i++) {
-    const q = closestOnSegment(p, poly[i], poly[(i + 1) % poly.length]);
-    best = Math.min(best, Math.hypot(p.x - q.x, p.y - q.y));
-  }
-  return best;
-}
-
-/**
- * How far a puck at `p`, `ticks` after the snapshot, is outside the reach of every mallet but yours. A mallet can be
- * anywhere it could have moved since the snapshot and, in wedge mode, inside its zone.
- */
-function clearance(world: World, seat: number, snap: Snap, p: Vec, ticks: number): number {
-  const { layout } = world;
-  const reach = layout.puckR + layout.malletR;
-  let clear = Infinity;
-  snap.mallets.forEach((m, s) => {
-    if (!m || s === seat) return;
-    let c = Math.hypot(p.x - m[0], p.y - m[1]) - reach - MALLET_MAX_SPEED * ticks * DT;
-    if (world.zone === 'wedge') c = Math.max(c, distToConvex(p, layout.wedges[s]) - reach);
-    clear = Math.min(clear, c);
-  });
-  return clear;
-}
-
 /**
  * Runs the server's physics forward from a snapshot with your own samples, one per tick, then a partial tick toward the
- * pointer. Other mallets stay where the snapshot has them.
+ * pointer. Other mallets carry on as they were moving at the snapshot, slowing to a stop.
  */
 export function predict(input: PredictInput): Prediction | null {
   const { layout, seat, snap } = input;
@@ -110,18 +85,20 @@ export function predict(input: PredictInput): Prediction | null {
   world.lastHitter = snap.hitter;
   world.frozen = !input.live;
 
-  const out: Prediction = { seat, k: snap.k, L: snap.k, puck: [], clear: [], events: [], goal: Infinity, mallet: { x: 0, y: 0 } };
+  const out: Prediction = { seat, k: snap.k, L: snap.k, puck: [], events: [], goal: Infinity, mallet: { x: 0, y: 0 }, mallets: [] };
   const record = (t: number) => {
     if (!input.live) return;
     const { puck } = world;
-    const prev = out.puck.at(-1);
     out.puck.push({ t, x: puck.x, y: puck.y, vx: puck.vx, vy: puck.vy, hitter: world.lastHitter });
-    // Halfway between states the puck can be nearer a mallet than at either end.
-    const between = prev ? Math.hypot(puck.x - prev.x, puck.y - prev.y) / 2 : 0;
-    out.clear.push(clearance(world, seat, snap, puck, t - snap.k) - between);
   };
   const advance = (target: Vec, dt: number, t: number) => {
     setTarget(world, seat, target);
+    snap.mallets.forEach((m, s) => {
+      const v = snap.motion[s];
+      if (!m || !v || s === seat) return;
+      const moved = GUESS_TICKS * (1 - Math.exp(-(t - snap.k) / GUESS_TICKS));
+      setTarget(world, s, { x: m[0] + v[0] * moved, y: m[1] + v[1] * moved });
+    });
     for (const e of step(world, dt)) {
       if (e.k !== 'goal') {
         out.events.push({ k: Math.ceil(t), e: wire(e) });
@@ -142,6 +119,7 @@ export function predict(input: PredictInput): Prediction | null {
   }
   const mallet = world.mallets[seat]!;
   out.mallet = { x: mallet.x, y: mallet.y };
+  out.mallets = world.mallets.map((m) => (m ? { x: m.x, y: m.y } : null));
   if (input.live) for (let i = 1; i <= EXTRA_TICKS; i++) advance(input.pointer, DT, out.L + i);
   return out;
 }

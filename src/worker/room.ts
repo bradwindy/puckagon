@@ -54,6 +54,9 @@ interface Inputs {
   queue: Sample[];
   /** Sequence number of the last sample a tick applied, or -1. */
   applied: number;
+  /** The fewest samples left waiting after a tick, over the ticks since the last check. */
+  spare: number;
+  watched: number;
 }
 
 export interface RoomSnapshot {
@@ -72,6 +75,11 @@ const SCORED_TICKS = ticks(SCORED_MS);
 const MATCH_PHASES: Phase[] = ['countdown', 'playing', 'scored'];
 /** Pointer samples a player may have waiting. More would add lag after a burst of late messages. */
 const INPUT_QUEUE = 4;
+/**
+ * A player who always had a sample to spare over this many ticks skips one, so the wait a burst of messages leaves
+ * behind drains away instead of adding lag for the rest of the match.
+ */
+const DRAIN_TICKS = 15;
 /** A puck jammed against a mallet makes a hit every tick. Only one hit per seat this many ticks apart reaches clients. */
 const HIT_EVENT_GAP = 4;
 /**
@@ -330,7 +338,7 @@ export class Room {
     if (typeof s !== 'number' || !Number.isSafeInteger(s) || s < 0) return;
     if (!Array.isArray(q) || q.length % 2 !== 0 || q.length > MAX_SAMPLES * 2 || !q.every(Number.isFinite)) return;
     let inputs = this.inputs.get(pid);
-    if (!inputs) this.inputs.set(pid, (inputs = { queue: [], applied: -1 }));
+    if (!inputs) this.inputs.set(pid, (inputs = { queue: [], applied: -1, spare: Infinity, watched: 0 }));
     const clamp = (n: number) => Math.max(-2, Math.min(2, n));
     for (let i = 0; i < q.length; i += 2) {
       inputs.queue.push({ x: clamp(q[i] as number), y: clamp(q[i + 1] as number), seq: s + i / 2 });
@@ -464,11 +472,18 @@ export class Room {
     for (const p of this.players) {
       const inputs = this.inputs.get(p.pid);
       if (p.bot || p.seat < 0 || p.out || !inputs) continue;
+      if (inputs.watched >= DRAIN_TICKS) {
+        if (inputs.spare > 0) inputs.queue.shift();
+        inputs.spare = Infinity;
+        inputs.watched = 0;
+      }
       const next = inputs.queue.shift();
       if (next) {
         setTarget(world, p.seat, next);
         inputs.applied = next.seq;
       }
+      inputs.spare = Math.min(inputs.spare, inputs.queue.length);
+      inputs.watched++;
     }
   }
 

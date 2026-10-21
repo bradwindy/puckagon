@@ -33,17 +33,11 @@ const LATE_MS = 1000;
  * background doesn't replay them all at once. It allows for the longest delay.
  */
 const STALE_TICKS = Math.ceil((SNAP_MS + MAX_MARGIN_MS) / TICK_MS) + 10;
-/**
- * While the puck's timeline moves toward local time or back, the puck looks at most this much faster or slower, in units a
- * second. Higher catches up sooner at high ping, and the speed change shows more.
- */
-export const WARP_SPEED = 0.6;
-const MAX_RATE = 3;
-const MIN_RATE = 0.4;
-/** How far outside every other mallet's reach the predicted puck must stay to be drawn in local time, and the extra it needs to go there. */
-const SAFE_MARGIN = 0.02;
-const SAFE_ENTER = 0.05;
-/** Time constant of the offset that hides corrections to the predicted puck. A bigger correction is a jump. */
+/** While local time drifts, the puck's timeline follows it no more than this much faster or slower than real time. */
+const FOLLOW_RATE = 0.2;
+/** Further from local time than this many ticks, the puck's timeline moves there at once and the offset hides the step. */
+const RESYNC_TICKS = 3;
+/** Time constant of the offset that hides corrections to the predicted puck and mallets. A bigger correction is a jump. */
 const CORRECTION_MS = 80;
 const MAX_CORRECTION = 0.5;
 /** A server event is the same as a shown predicted one of its kind and seat this many ticks either side. */
@@ -64,6 +58,8 @@ export interface Snap {
   hitter: number;
   /** By seat, the sequence number of the last pointer sample the server applied, or -1. */
   acks: number[];
+  /** By seat, how far each mallet moved per tick over the last couple of snapshots. */
+  motion: ([number, number] | 0)[];
 }
 
 /** Predicts from a snapshot with your input as it is now. `live` says whether the puck is in play at that snapshot. */
@@ -112,24 +108,18 @@ export class GameState {
   private showFrom = Infinity;
   /** The last frame hid the puck at a predicted goal. */
   private guessedGoal = false;
-  /**
-   * The tick the puck is drawn at. It runs between the interpolated past and local time, never goes back, and moves
-   * between the two slowly enough that the puck never jumps.
-   */
+  /** The tick the puck is drawn at: local time while there is a prediction, the interpolated past otherwise. It never goes back. */
   private puckTick = -Infinity;
   private viewedAt = -Infinity;
-  private ahead = false;
-  /** What the last frame drew the puck from. */
-  private base: { snap: Snap; live: boolean; predicted: boolean; lead: Prediction | null } | null = null;
-  /** Added to the drawn puck so a correction from a new snapshot fades in instead of jumping. */
+  /** What the last frame drew from. */
+  private base: { snap: Snap; live: boolean; predicted: boolean; lead: Prediction | null; pred: Prediction | null } | null = null;
+  /** Added to the drawn puck and mallets so a correction from a new snapshot fades in instead of jumping. */
   private offsetX = 0;
   private offsetY = 0;
+  private malletOffsets: Vec[] = [];
   private fired: Fired[] = [];
   /** Recent ticks the puck was drawn past in local time, ahead of the snapshots. */
   private guessed: number[] = [];
-
-  /** `warp` is WARP_SPEED unless the page asks for another, to compare how catching up looks. */
-  constructor(private warp = WARP_SPEED) {}
 
   get me(): PublicPlayer | undefined {
     return this.room?.players.find((p) => p.id === this.myId);
@@ -164,9 +154,9 @@ export class GameState {
     this.shownTick = -Infinity;
     this.puckTick = -Infinity;
     this.viewedAt = -Infinity;
-    this.ahead = false;
     this.base = null;
     this.offsetX = this.offsetY = 0;
+    this.malletOffsets = [];
     this.fired = [];
     this.guessed = [];
   }
@@ -219,7 +209,13 @@ export class GameState {
     const step = SLEW * Math.min(MAX_SLEW_GAP_MS, now - (prevAt ?? now));
     this.offset = prevAt === undefined || reanchor ? min : this.offset + clamp(min - this.offset, -step, step);
     this.delay += clamp(target - this.delay, -step, step);
-    this.snaps.push({ k: msg.k, puck: msg.p, mallets: msg.m, hitter: msg.h, acks: msg.a });
+    const before = this.snaps.at(-2) ?? this.snaps.at(-1);
+    const motion = msg.m.map((m, seat): [number, number] | 0 => {
+      const b = before?.mallets[seat];
+      const ticks = before ? msg.k - before.k : 0;
+      return m && b && ticks > 0 ? [(m[0] - b[0]) / ticks, (m[1] - b[1]) / ticks] : 0;
+    });
+    this.snaps.push({ k: msg.k, puck: msg.p, mallets: msg.m, hitter: msg.h, acks: msg.a, motion });
     if (this.snaps.length > 40) this.snaps.shift();
     for (const e of msg.e) this.arrive(msg.k, e);
   }
@@ -243,8 +239,8 @@ export class GameState {
   }
 
   /**
-   * Everything one frame draws. With a predictor the puck runs ahead into local time while no other mallet can reach it,
-   * and your mallet is drawn in local time.
+   * Everything one frame draws. With a predictor the puck and every mallet are drawn in local time, where your mallet
+   * is, so what you see touch is what touches.
    */
   view(now: number, predict: Predictor | null = null): View {
     const newest = this.snaps.at(-1);
@@ -258,15 +254,31 @@ export class GameState {
     const pred = predict?.(newest, live) ?? (predict && live && this.base?.snap === newest ? this.base.lead : null);
     const lead = pred && pred.puck.length > 0 ? pred : null;
 
-    const from = Number.isFinite(this.puckTick) ? this.puckTick : past;
-    this.puckTick = this.advance(from, past, newest, lead, dt / TICK_MS);
+    const known = Number.isFinite(this.puckTick);
+    const from = known ? this.puckTick : past;
+    const ticks = dt / TICK_MS;
+    const steady = from + ticks;
+    const target = lead ? lead.L : past;
+    const resync = target > from && Math.abs(target - steady) > RESYNC_TICKS;
+    this.puckTick = Math.max(from, resync ? target : clamp(target, steady - FOLLOW_RATE * ticks, steady + FOLLOW_RATE * ticks));
     const tick = this.puckTick;
 
     const decay = Math.exp(-dt / CORRECTION_MS);
     this.offsetX *= decay;
     this.offsetY *= decay;
+    this.malletOffsets.forEach((o) => {
+      o.x *= decay;
+      o.y *= decay;
+    });
+    if (resync && known) {
+      // Moving the timeline at once would make the puck jump, so it starts from where it would have been.
+      const was = this.puckAt(steady, newest, lead);
+      const is = this.puckAt(tick, newest, lead);
+      this.offsetX += was.x - is.x;
+      this.offsetY += was.y - is.y;
+    }
     const base = this.base;
-    if (base && (base.predicted || lead) && (base.snap !== newest || base.predicted !== !!lead)) {
+    if (!resync && base && (base.predicted || lead) && (base.snap !== newest || base.predicted !== !!lead)) {
       // Your own input is the same in both, so only what the server changed is smoothed.
       const old = base.predicted ? (predict?.(base.snap, base.live) ?? base.lead) : null;
       const was = this.puckAt(tick, base.snap, old && old.puck.length > 0 ? old : null);
@@ -274,7 +286,18 @@ export class GameState {
       this.offsetX += was.x - is.x;
       this.offsetY += was.y - is.y;
     }
-    this.base = { snap: newest, live, predicted: !!lead, lead };
+    if (base?.pred && pred && base.snap !== newest) {
+      const old = predict?.(base.snap, base.live) ?? base.pred;
+      pred.mallets.forEach((m, seat) => {
+        const was = old.mallets[seat];
+        if (!m || !was || seat === pred.seat) return;
+        const o = (this.malletOffsets[seat] ??= { x: 0, y: 0 });
+        o.x += was.x - m.x;
+        o.y += was.y - m.y;
+        if (Math.hypot(o.x, o.y) > MAX_CORRECTION) o.x = o.y = 0;
+      });
+    }
+    this.base = { snap: newest, live, predicted: !!lead, lead, pred };
 
     let served = false;
     if (tick >= this.showFrom) {
@@ -296,7 +319,7 @@ export class GameState {
     return {
       puck: hidden ? null : { x: state.x + this.offsetX, y: state.y + this.offsetY },
       speed: Math.hypot(state.vx, state.vy),
-      mallets: this.malletsAt(past),
+      mallets: pred ? pred.mallets.map((m, seat) => m && this.smoothed(m, seat)) : this.malletsAt(past),
       hitter: state.hitter,
       mallet: pred?.mallet ?? null,
       due,
@@ -308,27 +331,9 @@ export class GameState {
     return k < this.hiddenFrom || k >= this.showFrom;
   }
 
-  /**
-   * Moves the puck's tick toward local time when the predicted path stays out of every other mallet's reach, and back
-   * toward the past otherwise. The rate limit keeps the change in the puck's apparent speed under WARP_SPEED.
-   */
-  private advance(from: number, past: number, newest: Snap, lead: Prediction | null, ticks: number): number {
-    const speedAt = (t: number) => {
-      const s = this.puckAt(t, newest, lead);
-      return Math.hypot(s.vx, s.vy);
-    };
-    // The puck may speed up within the frame, so the limits hold for the faster end of it.
-    const speed = Math.max(speedAt(from), speedAt(from + MAX_RATE * ticks));
-    const fast = Math.min(MAX_RATE, 1 + this.warp / speed);
-    const slow = Math.max(MIN_RATE, 1 - this.warp / speed);
-    const need = SAFE_MARGIN + (this.ahead ? 0 : SAFE_ENTER);
-    // The first state is the snapshot itself, which no mallet can change.
-    this.ahead = !!lead && lead.clear.every((c, i) => i === 0 || c > need);
-    const target = this.ahead ? lead!.L : past;
-    const next = clamp(target, from + (this.ahead ? slow : MIN_RATE) * ticks, from + fast * ticks);
-    // When local time steps back a tick the puck carries on slowly into the extra predicted ticks instead of stopping.
-    const top = lead ? Math.max(past, Math.min(lead.puck.at(-1)!.t, Math.max(lead.L, from + slow * ticks))) : Infinity;
-    return Math.max(from, clamp(next, past, top));
+  private smoothed(m: Vec, seat: number): Vec {
+    const o = this.malletOffsets[seat];
+    return o ? { x: m.x + o.x, y: m.y + o.y } : m;
   }
 
   /** The events of every tick the puck's timeline crossed this frame: the server's up to the newest snapshot, predicted ones after it. */

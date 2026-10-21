@@ -3,8 +3,7 @@ import { predict, type Prediction, type PuckState } from '../src/client/predict'
 import { GameState, type Predictor, type Snap } from '../src/client/state';
 import { makeLayout } from '../src/shared/geometry';
 import { TICK_HZ, type RoomMsg, type ServerMsg, type SnapMsg, type WireEvent } from '../src/shared/protocol';
-import { DEFAULT_SETTINGS, type Settings } from '../src/shared/settings';
-import type { Vec } from '../src/shared/vec';
+import { DEFAULT_SETTINGS } from '../src/shared/settings';
 import { Room } from '../src/worker/room';
 
 const TICK_MS = 1000 / TICK_HZ;
@@ -34,6 +33,7 @@ describe('predict', () => {
       mallets: mallets.map((m) => (m ? [m.x, m.y] : 0)),
       hitter: -1,
       acks: snap.a,
+      motion: mallets.map(() => 0),
     };
     // A swing up into the puck's path.
     const swing = Array.from({ length: 20 }, (_, i) => ({ x: home.x + 0.12 - i * 0.004, y: home.y - i * 0.03 }));
@@ -61,38 +61,26 @@ describe('predict', () => {
     expect(pred.puck.slice(1, swing.length + 1).map((s) => [s.x, s.y, s.vx, s.vy])).toEqual(server);
   });
 
-  /** A puck drifting along x at y, with the other mallet at `other`, and `unacked` samples of yours still to apply. */
-  function clearance(zone: Settings['zone'], y: number, other: Vec, unacked: number): number {
-    const settings = { ...DEFAULT_SETTINGS, zone };
-    const layout = makeLayout(2, settings);
-    const me = { x: -0.3, y: 0.75 };
-    const pred = predict({
-      layout,
-      settings,
-      seat: 0,
-      open: [true, true],
-      snap: { k: 100, puck: [0, y, 0.2, 0], mallets: [[me.x, me.y], [other.x, other.y]], hitter: -1, acks: [0, -1] },
-      live: true,
-      applied: me,
-      next: Array.from({ length: unacked }, () => me),
-      pointer: me,
-      frac: 0,
-    })!;
-    return Math.min(...pred.clear.slice(1));
-  }
-
-  it('in wedge mode keeps the puck out of reach while it is far enough from every other zone', () => {
-    // The other mallet waits on the centre line, as close to your half as its zone allows.
-    expect(clearance('wedge', 0.5, { x: 0, y: -0.01 }, 9)).toBeGreaterThan(0.1);
-    expect(clearance('wedge', 0.08, { x: 0, y: -0.01 }, 9)).toBeLessThan(0);
-    // Near the line but with the other mallet too far away to get there in time.
-    expect(clearance('wedge', 0.08, { x: 0, y: -0.75 }, 2)).toBeGreaterThan(0);
-  });
-
-  it('in free mode counts how far other mallets could move before the puck gets there', () => {
-    expect(clearance('free', 0.5, { x: 0, y: -0.7 }, 3)).toBeGreaterThan(0);
-    expect(clearance('free', 0.5, { x: 0, y: -0.7 }, 12)).toBeLessThan(0);
-    expect(clearance('free', 0.5, { x: 0.1, y: 0.3 }, 1)).toBeLessThan(0);
+  it('guesses other mallets carry on as they last moved, slowing to a stop', () => {
+    const settings = { ...DEFAULT_SETTINGS, zone: 'free' as const };
+    const me = { x: -0.3, y: 0.6 };
+    const run = (ticks: number) =>
+      predict({
+        layout: makeLayout(2, settings),
+        settings,
+        seat: 0,
+        open: [true, true],
+        snap: { k: 100, puck: [0, 0, 0, 0], mallets: [[me.x, me.y], [0, -0.5]], hitter: -1, acks: [0, -1], motion: [0, [0.02, 0]] },
+        live: true,
+        applied: me,
+        next: Array.from({ length: ticks }, () => me),
+        pointer: me,
+        frac: 0,
+      })!.mallets[1]!;
+    expect(run(2).x).toBeGreaterThan(0.02);
+    expect(run(30).x).toBeGreaterThan(run(5).x);
+    expect(run(30).x).toBeLessThan(0.02 * 3 + 1e-9);
+    expect(run(30).y).toBeCloseTo(-0.5);
   });
 });
 
@@ -106,17 +94,17 @@ function snap(k: number, e: WireEvent[] = []): SnapMsg {
   return { t: 's', k, p: [xAt(k), 0, SPEED, 0], m: [[0, 0.7], [0, -0.7]], h: -1, e, a: [k, -1] };
 }
 
-/** A prediction along the same line as the snapshots, `lead` ticks ahead, every state `clear` of other mallets. */
-function line(s: Snap, lead: number, clear: number, events: { k: number; e: WireEvent }[] = []): Prediction {
+/** A prediction along the same line as the snapshots, `lead` ticks ahead. */
+function line(s: Snap, lead: number, events: { k: number; e: WireEvent }[] = []): Prediction {
   const L = s.k + lead;
   const puck = Array.from({ length: lead + 3 }, (_, i) => state(s.k + i));
-  return { seat: 0, k: s.k, L, puck, clear: puck.map(() => clear), events: events.filter((e) => e.k > s.k), goal: Infinity, mallet: { x: 0, y: 0.7 } };
+  return { seat: 0, k: s.k, L, puck, events: events.filter((e) => e.k > s.k), goal: Infinity, mallet: { x: 0, y: 0.7 }, mallets: [] };
 }
 
 interface Frame {
   /** The newest snapshot. */
   k: number;
-  /** The tick the puck is drawn at. */
+  /** The tick the puck is drawn at, read from where it is drawn. */
   tick: number;
   past: number;
   /** Local time. */
@@ -126,7 +114,7 @@ interface Frame {
 
 /**
  * Plays ticks [from, to): each snapshot arrives LATENCY_MS after its tick, with `events(k)`, and a frame is drawn every
- * tick with a predictor that runs `lead(k)` ticks ahead of the newest snapshot, is safe while `safe(k)`, and predicts
+ * tick with a predictor that runs `lead(k)` ticks ahead of the newest snapshot while `predicting(k)`, and predicts
  * `guesses(k)`.
  */
 function play(
@@ -135,7 +123,7 @@ function play(
   to: number,
   opts: {
     lead: (k: number) => number;
-    safe: (k: number) => boolean;
+    predicting: (k: number) => boolean;
     events?: (k: number) => WireEvent[];
     guesses?: (k: number) => { k: number; e: WireEvent }[];
   },
@@ -144,7 +132,7 @@ function play(
   let next = from;
   for (let now = from * TICK_MS + LATENCY_MS + 1; now < to * TICK_MS + LATENCY_MS; now += TICK_MS) {
     for (; next < to && next * TICK_MS + LATENCY_MS <= now; next++) st.onSnap(snap(next, opts.events?.(next)), next * TICK_MS + LATENCY_MS);
-    const predictor: Predictor = (s) => line(s, opts.lead(s.k), opts.safe(s.k) ? 1 : -1, opts.guesses?.(s.k));
+    const predictor: Predictor = (s) => (opts.predicting(s.k) ? line(s, opts.lead(s.k), opts.guesses?.(s.k)) : null);
     const v = st.view(now, predictor);
     const events = v.due.flatMap((d) => (d.kind === 'event' ? [d.e] : []));
     const k = next - 1;
@@ -160,31 +148,26 @@ function playing(): GameState {
 }
 
 describe('display timeline', () => {
-  it('runs ahead to local time while safe and back to the past when not, never going back or past either end', () => {
+  it('draws the puck in local time at a steady speed, never going back or jumping', () => {
     const st = playing();
-    // Local time steps back a tick at 200, as when the server drops a queued sample, and five ticks at 250.
-    const lead = (k: number) => (k < 200 ? 12 : k < 250 ? 10 : k < 400 ? 4 : 16);
-    const frames = play(st, 1, 700, { lead, safe: (k) => k >= 100 && k < 300 });
-    const held = (k: number) => k >= 250 && k < 258;
+    // Local time steps back a tick at 200 and 250, as when the server skips a queued sample, and jumps ahead twelve at
+    // 400, as when the connection gets slower.
+    const lead = (k: number) => (k < 200 ? 12 : k < 250 ? 11 : k < 400 ? 10 : 22);
+    const frames = play(st, 1, 700, { lead, predicting: (k) => k >= 100 });
     const eps = 1e-6;
     for (const [i, f] of frames.entries()) {
-      expect(f.tick).toBeGreaterThanOrEqual(f.past - eps);
-      // After a small step back the puck carries on slowly into the two ticks predicted past local time. After a big
-      // one it waits for local time to catch up.
-      const over = f.tick - Math.max(f.past, f.local);
-      expect(over).toBeLessThanOrEqual(f.k >= 200 && f.k < 206 ? 2 : held(f.k) ? 5 : eps);
       if (i === 0) continue;
       const rate = f.tick - frames[i - 1].tick;
       expect(rate).toBeGreaterThanOrEqual(-eps);
-      // At 1 unit a second the puck may run at most 1.6 times as fast and no slower than 0.4, except to keep up with the past.
-      expect(rate).toBeLessThanOrEqual(1.6 + 0.05);
-      if (f.tick > f.past + eps && !held(f.k)) expect(rate).toBeGreaterThanOrEqual(0.4 - eps);
+      // Following local time changes the speed by at most a fifth. Catching up after a jump fades in over a few frames.
+      const settling = (f.k >= 100 && f.k < 115) || (f.k >= 400 && f.k < 415);
+      expect(rate).toBeLessThanOrEqual(settling ? 4 : 1.2 + 0.05);
     }
     const at = (k: number) => frames.find((f) => f.k >= k)!;
     expect(at(95).tick - at(95).past).toBeLessThan(0.01);
-    expect(at(240).local - at(240).tick).toBeLessThan(0.01);
-    expect(at(290).local - at(290).tick).toBeLessThan(0.01);
-    expect(at(690).tick - at(690).past).toBeLessThan(0.01);
+    expect(Math.abs(at(240).local - at(240).tick)).toBeLessThan(0.01);
+    expect(Math.abs(at(390).local - at(390).tick)).toBeLessThan(0.01);
+    expect(Math.abs(at(500).local - at(500).tick)).toBeLessThan(0.01);
   });
 });
 
@@ -210,7 +193,7 @@ describe('effects on the display timeline', () => {
       if (k === 400) return [wall(4)];
       return [];
     };
-    const frames = play(st, 1, 500, { lead, safe: (k) => k >= 80, events, guesses });
+    const frames = play(st, 1, 500, { lead, predicting: (k) => k >= 80, events, guesses });
     const shown = frames.flatMap((f) => f.events);
     expect(shown.filter((e) => e[1] !== 2.5)).toEqual([wall(0.5), hit(0, 1.5), wall(2), wall(4)]);
     expect(shown.filter((e) => e[1] === 2.5)).toHaveLength(1);

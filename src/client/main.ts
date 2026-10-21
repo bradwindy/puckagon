@@ -13,7 +13,7 @@ import { Net, type NetStatus } from './net';
 import { SLOW_MS, UNSTABLE_RATE } from './ping';
 import { predictor } from './predict';
 import { Renderer, type Frame } from './render';
-import { GameState, WARP_SPEED, type Due } from './state';
+import { GameState, type Due } from './state';
 import { UI } from './ui';
 
 const NAME_KEY = 'puckagon:name';
@@ -55,12 +55,6 @@ function playerId(): string {
     storageSet(() => sessionStorage, PID_KEY, pid);
   }
   return pid;
-}
-
-/** `?warp=1.2` in the page URL sets how fast the puck may catch up to local time, to compare against the default. */
-function warpFromQuery(search: string): number {
-  const n = Number(new URLSearchParams(search).get('warp') || NaN);
-  return n >= 0 ? Math.min(5, n) : WARP_SPEED;
 }
 
 const savedName = () => sanitizeName(storageGet(() => localStorage, NAME_KEY));
@@ -119,7 +113,7 @@ class Attract {
 }
 
 class PartySession {
-  readonly state = new GameState(warpFromQuery(location.search));
+  readonly state = new GameState();
   readonly net: Net;
   status: NetStatus = 'connecting';
   pointer: Vec | null = null;
