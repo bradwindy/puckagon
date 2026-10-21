@@ -387,8 +387,13 @@ function route(): void {
 
 canvas.addEventListener('pointerdown', (e) => {
   sfx.unlock();
-  if (e.pointerType !== 'mouse') canvas.setPointerCapture(e.pointerId);
   if (party) party.pointer = { x: e.clientX, y: e.clientY };
+  if (e.pointerType === 'mouse') return;
+  try {
+    canvas.setPointerCapture(e.pointerId);
+  } catch {
+    // the pointer was already released; the next move still updates the mallet
+  }
 });
 canvas.addEventListener('pointermove', (e) => {
   if (party) party.pointer = { x: e.clientX, y: e.clientY };

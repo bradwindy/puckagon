@@ -506,6 +506,14 @@ input {
     0 -12px 24px rgba(10, 14, 38, 0.9);
 }
 
+/* It sits over the list while sticky, so a faded button must stay opaque. */
+.btn.primary.start:disabled {
+  opacity: 1;
+  background: linear-gradient(135deg, #5c2440, #3e2a6b);
+  color: rgba(255, 255, 255, 0.55);
+  box-shadow: 0 -12px 24px rgba(10, 14, 38, 0.9);
+}
+
 .watching,
 .muted {
   margin: 0;
