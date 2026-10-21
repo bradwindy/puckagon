@@ -1,0 +1,32 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "puckagon",
+  "main": "./src/worker/index.ts",
+  "compatibility_date": "2026-10-19",
+  "upload_source_maps": true,
+  "workers_dev": true,
+  "assets": {
+    // Party links like /p/ABCDE are navigations and fall back to index.html.
+    // Only the WebSocket API runs the Worker, so every other request is a free asset request.
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "PARTY", "class_name": "Party" }]
+  },
+  "exports": {
+    "Party": { "type": "durable-object", "storage": "sqlite" }
+  },
+  "previews": {
+    "durable_objects": {
+      "bindings": [{ "name": "PARTY", "class_name": "Party" }]
+    }
+  },
+  "observability": {
+    "enabled": true,
+    // WebSocket messages count as invocations, so per-message logs would burn the free log quota.
+    "logs": { "invocation_logs": false, "head_sampling_rate": 1 },
+    "traces": { "enabled": true, "head_sampling_rate": 0.01 },
+    "issues": { "enabled": true }
+  }
+}
