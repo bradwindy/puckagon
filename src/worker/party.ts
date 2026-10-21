@@ -1,6 +1,6 @@
 import { DurableObject } from 'cloudflare:workers';
-import { MAX_MESSAGE_BYTES, sanitizeName, TICK_HZ, type ClientMsg, type ServerMsg } from '../shared/protocol';
-import { Room, type RoomSnapshot } from './room';
+import { CLOSE, MAX_MESSAGE_BYTES, sanitizeName, TICK_HZ, type ClientMsg, type ServerMsg } from '../shared/protocol';
+import { MAX_PLAYERS, Room, type RoomSnapshot } from './room';
 
 interface Attachment {
   pid: string;
@@ -19,6 +19,7 @@ export class Party extends DurableObject<Env> {
   private purgeTimer: ReturnType<typeof setTimeout> | null = null;
   private lastTickAt = 0;
   private budget = new WeakMap<WebSocket, { second: number; count: number }>();
+  private saved = '';
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -38,7 +39,10 @@ export class Party extends DurableObject<Env> {
       if (att?.pid && ws.readyState === WebSocket.OPEN) this.sockets.set(att.pid, ws);
     }
     const snap = ctx.storage.kv.get<RoomSnapshot>(SNAPSHOT_KEY);
-    if (snap) this.room.restore(snap, new Set(this.sockets.keys()));
+    if (snap) {
+      this.room.restore(snap, new Set(this.sockets.keys()), Date.now());
+      this.schedulePurge();
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -64,10 +68,14 @@ export class Party extends DurableObject<Env> {
 
     if (msg.t === 'hello') {
       if (pid || typeof msg.pid !== 'string' || !PID_RE.test(msg.pid)) return;
+      if (!this.room.players.some((p) => p.pid === msg.pid) && this.room.players.length >= MAX_PLAYERS) {
+        this.closeQuietly(ws, CLOSE.full, 'This party is full');
+        return;
+      }
       const previous = this.sockets.get(msg.pid);
       ws.serializeAttachment({ pid: msg.pid } satisfies Attachment);
       this.sockets.set(msg.pid, ws);
-      if (previous && previous !== ws) this.closeQuietly(previous, 4000, 'Replaced by a newer connection');
+      if (previous && previous !== ws) this.closeQuietly(previous, CLOSE.replaced, 'Replaced by a newer connection');
       this.room.join(msg.pid, sanitizeName(msg.name) || 'Player');
       await this.afterChange();
       return;
@@ -87,25 +95,34 @@ export class Party extends DurableObject<Env> {
       case 'again':
         this.room.again(pid);
         break;
+      case 'addBot':
+        this.room.addBot(pid, msg.level);
+        break;
+      case 'removeBot':
+        this.room.removeBot(pid, msg.id);
+        break;
       default:
         return;
     }
     await this.afterChange();
   }
 
-  async webSocketClose(ws: WebSocket): Promise<void> {
-    await this.disconnect(ws);
+  async webSocketClose(ws: WebSocket, code: number): Promise<void> {
+    await this.disconnect(ws, code === CLOSE.left);
   }
 
   async webSocketError(ws: WebSocket): Promise<void> {
-    await this.disconnect(ws);
+    await this.disconnect(ws, false);
   }
 
-  private async disconnect(ws: WebSocket): Promise<void> {
+  private async disconnect(ws: WebSocket, quit: boolean): Promise<void> {
     const pid = (ws.deserializeAttachment() as Attachment | null)?.pid;
-    if (!pid || this.sockets.get(pid) !== ws) return;
+    if (!pid) return;
+    // After waking from hibernation the closing socket is no longer listed, so a missing entry still counts.
+    const current = this.sockets.get(pid);
+    if (current && current !== ws) return;
     this.sockets.delete(pid);
-    this.room.leave(pid, Date.now());
+    this.room.leave(pid, Date.now(), quit);
     await this.afterChange();
   }
 
@@ -125,10 +142,16 @@ export class Party extends DurableObject<Env> {
     if (this.room.players.length === 0) {
       this.stopLoop();
       this.clearPurge();
+      this.saved = '';
       await this.ctx.storage.deleteAll();
       return;
     }
-    this.ctx.storage.kv.put(SNAPSHOT_KEY, this.room.snapshot());
+    // Skip no-op writes: ignored messages from guests must not cost a row write each.
+    const json = JSON.stringify(this.room.snapshot());
+    if (json !== this.saved) {
+      this.ctx.storage.kv.put(SNAPSHOT_KEY, this.room.snapshot());
+      this.saved = json;
+    }
     if (this.room.inMatch) {
       this.clearPurge();
       this.startLoop();

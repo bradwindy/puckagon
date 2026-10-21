@@ -1,7 +1,7 @@
 import '@fontsource/chakra-petch/500.css';
 import '@fontsource/chakra-petch/700.css';
 import './style.css';
-import { clampToConvex, makeLayout, MAX_SEATS, MIN_SEATS, zoneFor } from '../shared/geometry';
+import { clampToConvex, homePosition, makeLayout, MAX_SEATS, MIN_SEATS, zoneFor } from '../shared/geometry';
 import { createWorld, serve, step, type World } from '../shared/physics';
 import {
   CODE_ALPHABET,
@@ -261,7 +261,10 @@ class PartySession {
     }
 
     const inMatch = MATCH.includes(room.phase);
-    if (inMatch && active >= 0 && this.myMallet && now - this.lastSent >= 1000 / INPUT_HZ) {
+    // Players who haven't touched the table yet still send heartbeats, from where the server parked their mallet.
+    if (inMatch && active >= 0 && !this.myMallet) this.myMallet = homePosition(layout, active, room.settings.zone);
+    // 2 ms of slack so 60 Hz frames (33.3 ms apart) don't fall just short and halve the send rate.
+    if (inMatch && active >= 0 && this.myMallet && now - this.lastSent >= 1000 / INPUT_HZ - 2) {
       const x = round(this.myMallet.x);
       const y = round(this.myMallet.y);
       const key = `${x},${y}`;
@@ -327,6 +330,8 @@ const ui = new UI(
     settings: (s) => party?.net.send({ t: 'settings', s }),
     start: () => party?.net.send({ t: 'start' }),
     again: () => party?.net.send({ t: 'again' }),
+    addBot: (level) => party?.net.send({ t: 'addBot', level }),
+    removeBot: (id) => party?.net.send({ t: 'removeBot', id }),
     leave() {
       history.pushState(null, '', '/');
       route();

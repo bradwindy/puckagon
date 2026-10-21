@@ -1,5 +1,5 @@
 import { MAX_SEATS, MIN_SEATS } from '../shared/geometry';
-import { CODE_LENGTH, NAME_MAX, PALETTE, type PublicPlayer } from '../shared/protocol';
+import { CODE_LENGTH, NAME_MAX, PALETTE, type BotLevel, type PublicPlayer } from '../shared/protocol';
 import { TARGET_MAX, TARGET_MIN, type Settings } from '../shared/settings';
 import type { NetStatus } from './net';
 import type { GameState } from './state';
@@ -31,6 +31,8 @@ export interface UIHandlers {
   settings(s: Partial<Settings>): void;
   start(): void;
   again(): void;
+  addBot(level: BotLevel): void;
+  removeBot(id: string): void;
   leave(): void;
   mute(): boolean;
   unlockAudio(): void;
@@ -54,11 +56,19 @@ const SPEED: Option<Settings['speed']>[] = [
   { value: 'normal', label: 'Normal' },
   { value: 'chaos', label: 'Chaos' },
 ];
+const BOTS: Option<BotLevel>[] = [
+  { value: 'easy', label: 'Easy' },
+  { value: 'medium', label: 'Medium' },
+  { value: 'hard', label: 'Hard' },
+];
 const SIZE: Option<Settings['goal']>[] = [
   { value: 'S', label: 'S' },
   { value: 'M', label: 'M' },
   { value: 'L', label: 'L' },
 ];
+
+/** Wide screens and landscape phones put the lobby beside the table instead of under it. Matches style.css. */
+const sidePanel = () => window.matchMedia('(min-width: 820px), (orientation: landscape) and (min-width: 640px)').matches;
 
 export class UI {
   private screen: HTMLElement | null = null;
@@ -113,6 +123,16 @@ export class UI {
       }
       return n;
     };
+    const join = () => {
+      const n = needName();
+      if (n) this.on.join(codeEl.value, n);
+    };
+    codeEl.enterKeyHint = 'go';
+    codeEl.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      join();
+    });
     const form = h(
       'form',
       {
@@ -135,10 +155,7 @@ export class UI {
           {
             class: 'btn',
             type: 'button',
-            onclick: () => {
-              const n = needName();
-              if (n) this.on.join(codeEl.value, n);
-            },
+            onclick: join,
           },
           'Join',
         ),
@@ -237,7 +254,10 @@ export class UI {
     const top = this.bar ? this.bar.offsetHeight + 8 : 0;
     const pad = 12;
     if (this.panel && !this.panel.classList.contains('hidden')) {
-      if (w >= 820) {
+      if (this.panel.classList.contains('mini')) {
+        return { x: pad, y: top + pad, w: w - pad * 2, h: hgt - top - pad * 2 - this.panel.offsetHeight - 16 };
+      }
+      if (sidePanel()) {
         const pw = this.panel.offsetWidth + 24;
         return { x: pad, y: top + pad, w: w - pw - pad * 2, h: hgt - top - pad * 2 };
       }
@@ -278,9 +298,10 @@ export class UI {
     else this.renderPlaying(state);
   }
 
-  private playerRow(p: PublicPlayer, state: GameState): HTMLElement {
+  private playerRow(p: PublicPlayer, state: GameState, removable = false): HTMLElement {
     const room = state.room!;
     const tags: string[] = [];
+    if (p.bot) tags.push(`${p.bot} bot`);
     if (p.id === room.host) tags.push('host');
     if (p.id === state.myId) tags.push('you');
     if (p.seat < 0) tags.push('watching');
@@ -291,6 +312,8 @@ export class UI {
       h('span', { class: 'dot', style: { '--c': PALETTE[p.color] } }),
       h('span', { class: 'name' }, p.name),
       h('span', { class: 'tags' }, tags.join(' · ')),
+      removable &&
+        h('button', { class: 'remove', title: `Remove ${p.name}`, 'aria-label': `Remove ${p.name}`, onclick: () => this.on.removeBot(p.id) }, '×'),
     );
   }
 
@@ -323,6 +346,7 @@ export class UI {
     const host = state.isHost;
     const s = room.settings;
     const seated = room.players.filter((p) => p.seat >= 0);
+    const ready = seated.filter((p) => p.connected).length;
     const set = (patch: Partial<Settings>) => this.on.settings(patch);
 
     const stepper = h(
@@ -338,14 +362,14 @@ export class UI {
       ),
     );
 
-    const canStart = host && seated.length >= MIN_SEATS;
+    const canStart = host && ready >= MIN_SEATS;
     const startLabel = host
-      ? seated.length < MIN_SEATS
+      ? ready < MIN_SEATS
         ? 'Waiting for players…'
-        : `Start with ${seated.length}`
+        : `Start with ${ready}`
       : 'Waiting for the host to start';
 
-    this.panel!.replaceChildren(
+    const children: Child[] = [
       h(
         'div',
         { class: 'invitebox' },
@@ -353,7 +377,21 @@ export class UI {
         h('button', { class: 'btn primary', onclick: () => this.copyLink() }, 'Copy invite link'),
       ),
       h('h2', {}, `Players ${seated.length}/${MAX_SEATS}`),
-      h('ul', { class: 'players' }, ...room.players.map((p) => this.playerRow(p, state))),
+      h('ul', { class: 'players' }, ...room.players.map((p) => this.playerRow(p, state, host && !!p.bot))),
+      host &&
+        h(
+          'div',
+          { class: 'setting' },
+          h('span', { class: 'label' }, 'Add a bot'),
+          h(
+            'div',
+            { class: 'seg', role: 'group', 'aria-label': 'Add a bot' },
+            ...BOTS.map((b) =>
+              h('button', { disabled: seated.length >= MAX_SEATS, onclick: () => this.on.addBot(b.value) }, `+ ${b.label}`),
+            ),
+          ),
+        ),
+      host && ready < MIN_SEATS && h('p', { class: 'muted hint-solo' }, 'Share the link, or add a bot to play solo.'),
       h('h2', {}, host ? 'Settings' : 'Settings (host picks)'),
       this.segmented('Scoring', MODE, s.mode, host, (mode) => set({ mode })),
       stepper,
@@ -362,14 +400,17 @@ export class UI {
       this.segmented('Goal size', SIZE, s.goal, host, (goal) => set({ goal })),
       this.segmented('Mallet size', SIZE, s.mallet, host, (mallet) => set({ mallet })),
       h('button', { class: 'btn primary big start', disabled: !canStart, onclick: () => this.on.start() }, startLabel),
-    );
+    ];
+    this.panel!.replaceChildren(...children.filter((c): c is Node => c instanceof Node));
     this.panel!.classList.remove('hidden', 'mini');
   }
 
   private renderPlaying(state: GameState): void {
     const me = state.me;
     if (me && me.seat < 0) {
-      this.panel!.replaceChildren(h('p', { class: 'watching' }, "You're watching. You'll play next match."));
+      const full = state.room!.players.filter((p) => p.seat >= 0 && !p.bot).length >= MAX_SEATS;
+      const text = full ? "You're watching. The table is full, so you'll get the next free seat." : "You're watching. You'll play next match.";
+      this.panel!.replaceChildren(h('p', { class: 'watching' }, text));
       this.panel!.classList.remove('hidden');
       this.panel!.classList.add('mini');
     } else {
@@ -406,7 +447,7 @@ export class UI {
         ),
       ),
       state.isHost
-        ? h('button', { class: 'btn primary big', onclick: () => this.on.again() }, 'Play again')
+        ? h('button', { class: 'btn primary big start', onclick: () => this.on.again() }, 'Play again')
         : h('p', { class: 'muted' }, 'Waiting for the host to start another round'),
     );
     this.panel!.classList.remove('hidden');

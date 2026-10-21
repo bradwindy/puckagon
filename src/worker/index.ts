@@ -1,4 +1,4 @@
-import { normalizeCode, PROTOCOL_VERSION } from '../shared/protocol';
+import { CLOSE, normalizeCode, PROTOCOL_VERSION } from '../shared/protocol';
 
 export { Party } from './party';
 
@@ -23,7 +23,7 @@ function originHost(origin: string): string | null {
 function outdated(): Response {
   const { 0: client, 1: server } = new WebSocketPair();
   server.accept();
-  server.close(4001, 'Puckagon was updated. Reload the page.');
+  server.close(CLOSE.outdated, 'Puckagon was updated. Reload the page.');
   return new Response(null, { status: 101, webSocket: client });
 }
 

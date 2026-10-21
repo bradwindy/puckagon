@@ -311,6 +311,16 @@ input {
   -webkit-backdrop-filter: blur(14px);
 }
 
+@media (orientation: landscape) and (max-width: 819px) and (min-width: 640px) {
+  .panel {
+    top: 56px;
+    bottom: 8px;
+    width: 300px;
+    padding: 12px;
+    gap: 8px;
+  }
+}
+
 .panel.mini {
   top: auto;
   bottom: 16px;
@@ -390,6 +400,24 @@ input {
 .tags {
   color: var(--muted);
   font-size: 12px;
+}
+
+.remove {
+  border: none;
+  background: none;
+  color: var(--muted);
+  font-size: 18px;
+  line-height: 1;
+  padding: 0 4px;
+  cursor: pointer;
+}
+
+.remove:hover {
+  color: #ff8aa6;
+}
+
+.hint-solo {
+  font-size: 13px;
 }
 
 .pts {
@@ -523,7 +551,7 @@ input {
   pointer-events: auto !important;
 }
 
-@media (max-width: 819px) {
+@media (max-width: 819px) and (orientation: portrait), (max-width: 639px) {
   .panel {
     top: auto;
     left: 8px;

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { insideConvex, makeLayout, MAX_SEATS, MIN_SEATS } from '../src/shared/geometry';
-import { createWorld, placeMallet, serve, step, type SimEvent, type World } from '../src/shared/physics';
+import { createWorld, placeMallet, serve, setTarget, step, type SimEvent, type World } from '../src/shared/physics';
 import { DEFAULT_SETTINGS, type Settings } from '../src/shared/settings';
 
 const DT = 1 / 60;
@@ -73,6 +73,30 @@ describe('step', () => {
       }
     },
   );
+
+  it.each([2, 3, 4, 5, 6])('never traps the puck inside a mallet pushed into a corner of a %i-player table', (n) => {
+    for (const mallet of ['S', 'M', 'L'] as const) {
+      const w = world(n, { mallet });
+      const { puckR, malletR } = w.layout;
+      const side = w.layout.sides[w.layout.goalSide[0]];
+      for (const corner of [side.a, side.b]) {
+        placeMallet(w, 0, { x: corner.x * 0.6, y: corner.y * 0.6 });
+        const m = w.mallets[0]!;
+        const dx = corner.x - m.x;
+        const dy = corner.y - m.y;
+        const dl = Math.hypot(dx, dy);
+        const gap = puckR + malletR + 0.02;
+        w.puck = { x: m.x + (dx / dl) * gap, y: m.y + (dy / dl) * gap, vx: 0, vy: 0 };
+        setTarget(w, 0, { x: corner.x * 1.5, y: corner.y * 1.5 });
+        let embeddedTicks = 0;
+        for (let i = 0; i < 5 / DT; i++) {
+          step(w, DT);
+          if (puckR + malletR - Math.hypot(w.puck.x - m.x, w.puck.y - m.y) > 0.005) embeddedTicks++;
+        }
+        expect(embeddedTicks * DT).toBeLessThan(0.25);
+      }
+    }
+  });
 
   it('serves at rest inside the receiving seat’s own zone', () => {
     for (const n of [2, 3, 7, 12]) {

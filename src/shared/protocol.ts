@@ -1,7 +1,7 @@
 import type { Settings } from './settings';
 
 /** Bump when client and server messages change shape, so stale tabs are told to reload. */
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 export const TICK_HZ = 60;
 export const SNAP_EVERY = 2;
 export const INPUT_HZ = 30;
@@ -13,6 +13,14 @@ export const RECONNECT_GRACE_MS = 15000;
 export const LOBBY_GRACE_MS = 8000;
 export const NAME_MAX = 16;
 export const MAX_MESSAGE_BYTES = 2048;
+
+/** Application WebSocket close codes. */
+export const CLOSE = {
+  replaced: 4000,
+  outdated: 4001,
+  full: 4002,
+  left: 4003,
+} as const;
 
 export const PALETTE = [
   '#ff2e63',
@@ -42,13 +50,17 @@ export function sanitizeName(raw: unknown): string {
   if (typeof raw !== 'string') return '';
   const cleaned = raw
     .normalize('NFC')
-    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, '')
+    // Strip control and format characters (bidi overrides, zero-width spaces), but keep the joiners emoji need.
+    .replace(/(?![\u200d\u{e0020}-\u{e007f}])[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, '')
     .replace(/\s+/g, ' ')
     .trim();
   return Array.from(cleaned).slice(0, NAME_MAX).join('').trim();
 }
 
 export type Phase = 'lobby' | 'countdown' | 'playing' | 'scored' | 'over';
+
+export const BOT_LEVELS = ['easy', 'medium', 'hard'] as const;
+export type BotLevel = (typeof BOT_LEVELS)[number];
 
 export interface PublicPlayer {
   id: string;
@@ -60,6 +72,8 @@ export interface PublicPlayer {
   lives: number;
   out: boolean;
   connected: boolean;
+  /** Difficulty for computer players, null for people. */
+  bot: BotLevel | null;
 }
 
 export type GoalKind = 'score' | 'own' | 'none' | 'life';
@@ -115,6 +129,8 @@ export type ClientMsg =
   | { t: 'p'; x: number; y: number }
   | { t: 'settings'; s: Partial<Settings> }
   | { t: 'start' }
-  | { t: 'again' };
+  | { t: 'again' }
+  | { t: 'addBot'; level: BotLevel }
+  | { t: 'removeBot'; id: string };
 
 export const round = (n: number): number => Math.round(n * 10000) / 10000;

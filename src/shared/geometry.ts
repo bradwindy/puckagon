@@ -84,6 +84,37 @@ export function insetPolygon(poly: Vec[], insets: number[]): Vec[] {
   });
 }
 
+/** Keeps the part of a convex polygon where dot(p - origin, normal) >= offset. */
+function clipHalfPlane(poly: Vec[], origin: Vec, normal: Vec, offset: number): Vec[] {
+  const out: Vec[] = [];
+  const side = (p: Vec) => dot(sub(p, origin), normal) - offset;
+  for (let i = 0; i < poly.length; i++) {
+    const a = poly[i];
+    const b = poly[(i + 1) % poly.length];
+    const sa = side(a);
+    const sb = side(b);
+    if (sa >= 0) out.push(a);
+    if (sa >= 0 !== sb >= 0) out.push(add(a, scale(sub(b, a), sa / (sa - sb))));
+  }
+  return out;
+}
+
+/**
+ * Keeps mallets far enough out of each table corner that a puck always fits between them and the
+ * corner. Otherwise a mallet held in a sharp corner traps the puck inside itself.
+ */
+function clearCorners(zone: Vec[], verts: Vec[], puckR: number, malletR: number): Vec[] {
+  let clipped = zone;
+  verts.forEach((corner, i) => {
+    const toPrev = norm(sub(verts[(i - 1 + verts.length) % verts.length], corner));
+    const toNext = norm(sub(verts[(i + 1) % verts.length], corner));
+    const half = Math.acos(Math.max(-1, Math.min(1, dot(toPrev, toNext)))) / 2;
+    const clearance = malletR + puckR + puckR / Math.sin(half) + 0.002;
+    clipped = clipHalfPlane(clipped, corner, norm(add(toPrev, toNext)), clearance);
+  });
+  return clipped;
+}
+
 export function insideConvex(p: Vec, poly: Vec[]): boolean {
   const c = centroid(poly);
   for (let i = 0; i < poly.length; i++) {
@@ -154,13 +185,13 @@ export function makeLayout(seats: number, settings: Pick<Settings, 'goal' | 'mal
       const h = RECT_H / 2;
       const sy = seat === 0 ? 1 : -1;
       const half = [v(-w * sy, 0), v(w * sy, 0), v(w * sy, h * sy), v(-w * sy, h * sy)];
-      wedges.push(insetPolygon(half, [0, malletR, malletR, malletR]));
+      wedges.push(clearCorners(insetPolygon(half, [0, malletR, malletR, malletR]), verts, puckR, malletR));
     } else {
       const side = sides[goalSide[seat]];
-      wedges.push(insetPolygon([origin, side.a, side.b], [0, malletR, 0]));
+      wedges.push(clearCorners(insetPolygon([origin, side.a, side.b], [0, malletR, 0]), verts, puckR, malletR));
     }
   }
-  const free = insetPolygon(verts, verts.map(() => malletR));
+  const free = clearCorners(insetPolygon(verts, verts.map(() => malletR)), verts, puckR, malletR);
   const extent = Math.max(...verts.map(len));
 
   return { seats: n, verts, sides, goalSide, facing, wedges, free, puckR, malletR, goalHalf, extent };

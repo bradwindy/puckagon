@@ -37,6 +37,8 @@ export interface World {
   mallets: (Mallet | null)[];
   open: boolean[];
   lastHitter: number;
+  /** Seats that have touched the puck since it was served, most recent first, each once. */
+  touches: number[];
   frozen: boolean;
   idle: number;
   rng: () => number;
@@ -51,6 +53,7 @@ export function createWorld(layout: Layout, settings: Settings, rng: () => numbe
     mallets: Array.from({ length: layout.seats }, () => null),
     open: Array.from({ length: layout.seats }, () => true),
     lastHitter: -1,
+    touches: [],
     frozen: true,
     idle: 0,
     rng,
@@ -74,6 +77,7 @@ export function resetPuck(world: World): void {
   world.puck = { x: 0, y: 0, vx: 0, vy: 0 };
   world.frozen = true;
   world.lastHitter = -1;
+  world.touches = [];
   world.idle = 0;
 }
 
@@ -168,6 +172,7 @@ export function step(world: World, dt: number): SimEvent[] {
         puck.vx += nx * impulse;
         puck.vy += ny * impulse;
         world.lastHitter = seat;
+        if (world.touches[0] !== seat) world.touches = [seat, ...world.touches.filter((s) => s !== seat)];
         const s = Math.min(1, impulse / world.speed.max);
         if (s > HIT_EVENT_MIN) events.push({ k: 'hit', x: m.x + nx * rm, y: m.y + ny * rm, s, seat });
       }

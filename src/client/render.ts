@@ -588,14 +588,15 @@ export class Renderer {
       const color = PALETTE[p.color];
       let text = p.name;
       if (f.phase !== 'lobby') {
-        text = f.settings.mode === 'lives' ? `${p.name}  ${p.out ? 'OUT' : '♥'.repeat(Math.min(p.lives, 15))}` : `${p.name}  ${p.score}`;
+        text = f.settings.mode === 'lives' ? `${p.name}  ${p.out ? 'OUT' : `♥${p.lives}`}` : `${p.name}  ${p.score}`;
       }
       ctx.font = `700 ${size}px "Chakra Petch", system-ui, sans-serif`;
       ctx.shadowColor = color;
       ctx.shadowBlur = 10;
       ctx.fillStyle = p.out ? 'rgba(160,170,200,0.5)' : color;
       ctx.globalAlpha = p.connected ? 1 : 0.5;
-      ctx.fillText(text, s.x, s.y);
+      const room = ctx.textAlign === 'left' ? this.width - s.x - 6 : ctx.textAlign === 'right' ? s.x - 6 : Math.min(s.x, this.width - s.x) * 2 - 12;
+      ctx.fillText(text, s.x, s.y, Math.max(40, room));
       ctx.globalAlpha = 1;
     }
     ctx.restore();

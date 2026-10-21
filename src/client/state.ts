@@ -1,11 +1,13 @@
 import { makeLayout, type Layout } from '../shared/geometry';
-import { TICK_HZ, type GoalInfo, type PublicPlayer, type RoomMsg, type SnapMsg, type WireEvent } from '../shared/protocol';
+import { SNAP_EVERY, TICK_HZ, type GoalInfo, type PublicPlayer, type RoomMsg, type SnapMsg, type WireEvent } from '../shared/protocol';
 import type { Vec } from '../shared/vec';
 
 const TICK_MS = 1000 / TICK_HZ;
 const DELAY_MS = 75;
 const TELEPORT = 0.25;
 const MAX_EXTRAPOLATE_MS = 100;
+/** Events this many ticks behind the render clock are dropped, so a tab coming back from the background doesn't replay them all at once. */
+const STALE_TICKS = 10;
 
 interface Snap {
   k: number;
@@ -60,10 +62,14 @@ export class GameState {
       this.snaps = [];
       this.queue = [];
       this.hiddenFrom = this.showFrom = Infinity;
+      // The server tick doesn't advance between matches, so the clock estimate must start again.
+      this.offset = Infinity;
     }
+    if (!prev && msg.phase === 'scored') this.hiddenFrom = -Infinity;
     if (msg.phase === 'playing' && prev?.phase !== 'playing') {
       this.hiddenFrom = -Infinity;
-      this.showFrom = (this.snaps.at(-1)?.k ?? 0) + 1;
+      // The serve happens on the tick after the last snap we have, and shows up in the next snap.
+      this.showFrom = (this.snaps.at(-1)?.k ?? 0) + SNAP_EVERY;
     }
   }
 
@@ -81,7 +87,9 @@ export class GameState {
       this.queue = [];
       this.offset = Infinity;
     }
-    this.offset = Math.min(this.offset + 0.02, now - msg.k * TICK_MS);
+    const estimate = now - msg.k * TICK_MS;
+    // Normally keep the earliest arrival seen (least delayed); re-anchor if the server stalled and the estimate jumped.
+    this.offset = estimate > this.offset + DELAY_MS ? estimate : Math.min(this.offset + 0.02, estimate);
     this.snaps.push({ k: msg.k, puck: msg.p, mallets: msg.m, hitter: msg.h });
     if (this.snaps.length > 40) this.snaps.shift();
     for (const e of msg.e) this.queue.push({ k: msg.k, due: { kind: 'event', e } });
@@ -89,6 +97,9 @@ export class GameState {
 
   onGoal(k: number, goal: GoalInfo): void {
     this.queue.push({ k, due: { kind: 'goal', goal } });
+    // Set on arrival rather than when due, so a later serve message always wins even if frames were paused.
+    this.hiddenFrom = k;
+    this.showFrom = Infinity;
   }
 
   renderTick(now: number): number {
@@ -101,11 +112,7 @@ export class GameState {
     const due: Due[] = [];
     this.queue = this.queue.filter((q) => {
       if (q.k > tick) return true;
-      if (q.due.kind === 'goal') {
-        this.hiddenFrom = q.k;
-        this.showFrom = Infinity;
-      }
-      due.push(q.due);
+      if (tick - q.k <= STALE_TICKS) due.push(q.due);
       return false;
     });
     return due;

@@ -1,6 +1,6 @@
-import { PROTOCOL_VERSION, type ClientMsg, type ServerMsg } from '../shared/protocol';
+import { CLOSE, PROTOCOL_VERSION, type ClientMsg, type ServerMsg } from '../shared/protocol';
 
-export type NetStatus = 'connecting' | 'open' | 'reconnecting' | 'replaced' | 'outdated';
+export type NetStatus = 'connecting' | 'open' | 'reconnecting' | 'replaced' | 'outdated' | 'full';
 
 const PING_MS = 20000;
 
@@ -41,8 +41,9 @@ export class Net {
       if (this.ping) clearInterval(this.ping);
       this.ping = null;
       if (this.stopped || this.ws !== ws) return;
-      if (ev.code === 4000 || ev.code === 4001) {
-        this.setStatus(ev.code === 4000 ? 'replaced' : 'outdated');
+      const final = { [CLOSE.replaced]: 'replaced', [CLOSE.outdated]: 'outdated', [CLOSE.full]: 'full' } as const;
+      if (ev.code in final) {
+        this.setStatus(final[ev.code as keyof typeof final]);
         return;
       }
       this.setStatus('reconnecting');
@@ -59,7 +60,7 @@ export class Net {
     this.stopped = true;
     if (this.retry) clearTimeout(this.retry);
     if (this.ping) clearInterval(this.ping);
-    this.ws?.close(1000, 'Left the party');
+    this.ws?.close(CLOSE.left, 'Left the party');
   }
 
   private setStatus(status: NetStatus): void {

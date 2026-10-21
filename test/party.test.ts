@@ -1,6 +1,8 @@
-import { exports } from 'cloudflare:workers';
+import { evictDurableObject } from 'cloudflare:test';
+import { env, exports } from 'cloudflare:workers';
 import { describe, expect, it } from 'vitest';
-import { PROTOCOL_VERSION, type RoomMsg, type ServerMsg, type SnapMsg } from '../src/shared/protocol';
+import { CLOSE, PROTOCOL_VERSION, type RoomMsg, type ServerMsg, type SnapMsg } from '../src/shared/protocol';
+import { MAX_PLAYERS } from '../src/worker/room';
 
 interface Client {
   ws: WebSocket;
@@ -115,4 +117,41 @@ describe('Party Durable Object', () => {
     expect((await a.closed).code).toBe(4000);
     b.ws.close(1000);
   });
+
+  it('still runs the leave path when a socket closes after the party went to sleep', async () => {
+    const host = await connect('SNPPY');
+    host.send({ t: 'hello', pid: 'sleepy-host-token-1', name: 'Host' });
+    await host.until(isRoom((m) => m.players.length === 1));
+    const guest = await connect('SNPPY');
+    guest.send({ t: 'hello', pid: 'sleepy-guest-token-1', name: 'Guest' });
+    const first = await guest.until((m): m is Extract<ServerMsg, { t: 'welcome' }> => m.t === 'welcome');
+    await host.until(isRoom((m) => m.players.length === 2));
+
+    await evictDurableObject(env.PARTY.getByName('SNPPY'));
+    host.messages.length = 0;
+    guest.ws.close(1000);
+    const away = await host.until(isRoom((m) => m.players.some((p) => p.name === 'Guest' && !p.connected)));
+    expect(away.host).toBe(away.players[0].id);
+
+    const back = await connect('SNPPY');
+    back.send({ t: 'hello', pid: 'sleepy-guest-token-1', name: 'Guest' });
+    const again = await back.until((m): m is Extract<ServerMsg, { t: 'welcome' }> => m.t === 'welcome');
+    expect(again.id).toBe(first.id);
+    host.ws.close(CLOSE.left);
+    back.ws.close(CLOSE.left);
+  });
+
+  it('turns new players away once the party is full', async () => {
+    const clients: Client[] = [];
+    for (let i = 0; i < MAX_PLAYERS; i++) {
+      const c = await connect('FHVVV');
+      c.send({ t: 'hello', pid: `full-party-player-${String(i).padStart(4, '0')}`, name: `P${i}` });
+      clients.push(c);
+    }
+    await clients[0].until(isRoom((m) => m.players.length === MAX_PLAYERS));
+    const late = await connect('FHVVV');
+    late.send({ t: 'hello', pid: 'full-party-player-late', name: 'Late' });
+    expect((await late.closed).code).toBe(CLOSE.full);
+    for (const c of clients) c.ws.close(CLOSE.left);
+  }, 20000);
 });
