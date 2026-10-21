@@ -64,7 +64,7 @@ npm run check
 
 `npm run dev` serves the game at http://localhost:5173 with the Worker and Durable Object running locally in `workerd`. `npm run check` runs the type check, lint and tests. The tests run inside the Workers runtime through `@cloudflare/vitest-plugin`. They include a two-player match over real WebSockets and a party that is put to sleep and woken up again.
 
-To feel a slow connection, add `?lag=250` to the page URL, and `&jitter=30` for an unsteady one. Every message is then held back by half the lag each way. It works on the live site too.
+To feel a slow connection, add `?lag=250` to the page URL, and `&jitter=30` for an unsteady one. Every message is then held back by half the lag each way. It works on the live site too. Add `&warp=1.2` to change how fast the puck may catch up to your own time (default 0.6 units a second of apparent extra speed, 0 never catches up). Higher makes your hits react sooner at high ping, and makes the puck visibly speed up as it comes to you.
 
 After changing `wrangler.jsonc`, regenerate the binding types with `npm run types`.
 

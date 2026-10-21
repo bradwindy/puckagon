@@ -33,8 +33,11 @@ const LATE_MS = 1000;
  * background doesn't replay them all at once. It allows for the longest delay.
  */
 const STALE_TICKS = Math.ceil((SNAP_MS + MAX_MARGIN_MS) / TICK_MS) + 10;
-/** While the puck's timeline moves toward local time or back, the puck looks at most this much faster or slower, in units a second. */
-const WARP_SPEED = 0.6;
+/**
+ * While the puck's timeline moves toward local time or back, the puck looks at most this much faster or slower, in units a
+ * second. Higher catches up sooner at high ping, and the speed change shows more.
+ */
+export const WARP_SPEED = 0.6;
 const MAX_RATE = 3;
 const MIN_RATE = 0.4;
 /** How far outside every other mallet's reach the predicted puck must stay to be drawn in local time, and the extra it needs to go there. */
@@ -124,6 +127,9 @@ export class GameState {
   private fired: Fired[] = [];
   /** Recent ticks the puck was drawn past in local time, ahead of the snapshots. */
   private guessed: number[] = [];
+
+  /** `warp` is WARP_SPEED unless the page asks for another, to compare how catching up looks. */
+  constructor(private warp = WARP_SPEED) {}
 
   get me(): PublicPlayer | undefined {
     return this.room?.players.find((p) => p.id === this.myId);
@@ -313,8 +319,8 @@ export class GameState {
     };
     // The puck may speed up within the frame, so the limits hold for the faster end of it.
     const speed = Math.max(speedAt(from), speedAt(from + MAX_RATE * ticks));
-    const fast = Math.min(MAX_RATE, 1 + WARP_SPEED / speed);
-    const slow = Math.max(MIN_RATE, 1 - WARP_SPEED / speed);
+    const fast = Math.min(MAX_RATE, 1 + this.warp / speed);
+    const slow = Math.max(MIN_RATE, 1 - this.warp / speed);
     const need = SAFE_MARGIN + (this.ahead ? 0 : SAFE_ENTER);
     // The first state is the snapshot itself, which no mallet can change.
     this.ahead = !!lead && lead.clear.every((c, i) => i === 0 || c > need);
