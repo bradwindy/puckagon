@@ -26,13 +26,22 @@ The whole game is one Cloudflare Worker.
 - `src/worker` holds the Worker, one Durable Object class, `Party`, and the bot logic. Each party code maps to its own Durable Object through `getByName(code)`. It runs the physics at 60 Hz and sends a snapshot every tick over WebSockets.
 - `src/shared` holds code that both sides run. That covers table geometry, physics, settings and the message protocol.
 
-The server is authoritative. Clients sample the pointer at 60 Hz and send two samples per message, 30 messages a second, and the server applies one sample per tick from a short queue. Clients draw their own mallet straight from the pointer, and draw everything else a little behind the server so motion stays smooth. That delay adapts to how much the connection jitters, from about 40 ms on a steady line.
+The server is authoritative. Clients sample the pointer at 60 Hz and send two samples per message, 30 messages a second, and the server applies one sample per tick from a short queue. Each snapshot says which of your samples the server has applied.
+
+Clients draw other players a little behind the server so motion stays smooth. That delay adapts to how much the connection jitters, from about 40 ms on a steady line. The puck runs on two timelines (`src/client/predict.ts`):
+
+- While only you can reach it, your browser runs the shared physics forward from the newest snapshot with the samples the server hasn't applied yet. The puck is drawn in your own time, so your hits react when your mallet meets it, and your mallet is drawn where the server will put it.
+- As it comes within reach of another mallet, it eases back to the delayed view, so other players' hits line up with their mallets.
+- Moving between the two only speeds the puck up or slows it down a little, so it never jumps. Server corrections fade out over about 80 ms.
+
+In wedge mode with two players this cuts the time before your hit shows from about 130 ms to about 50 ms on a 30 ms ping. Free-roam tables and big tables gain less, because some other mallet can almost always reach the puck.
 
 Some details follow the current Cloudflare guidance:
 
 - Sockets use the WebSocket Hibernation API, so an idle lobby costs nothing. The physics timer only exists while a match is running.
 - Physics advances by a fixed 1/60 s per tick. The loop is a `setTimeout` chain that aims at each tick boundary and runs the ticks the wall clock says are due. A plain `setInterval(fn, 1000 / 60)` runs at 62.5 Hz in production, because the runtime rounds the delay down to whole milliseconds.
 - Clients time the runtime's automatic `ping`/`pong` reply, which never wakes the Durable Object, for the ping display.
+- When a match starts the room logs which Cloudflare data centre each player connected through, and its own, in Workers Logs. A party is hosted near whoever creates it, so this shows when a far-away host (or a VPN) is making a game laggy.
 - Lobby state is written to the Durable Object's SQLite storage only when something changes, never per tick.
 - The Worker checks the upgrade header, origin, party code and protocol version before a request reaches a Durable Object.
 - Static assets are served without running the Worker. Only `/api/*` runs it.
@@ -54,6 +63,8 @@ npm run check
 ```
 
 `npm run dev` serves the game at http://localhost:5173 with the Worker and Durable Object running locally in `workerd`. `npm run check` runs the type check, lint and tests. The tests run inside the Workers runtime through `@cloudflare/vitest-plugin`. They include a two-player match over real WebSockets and a party that is put to sleep and woken up again.
+
+To feel a slow connection, add `?lag=250` to the page URL, and `&jitter=30` for an unsteady one. Every message is then held back by half the lag each way. It works on the live site too.
 
 After changing `wrangler.jsonc`, regenerate the binding types with `npm run types`.
 

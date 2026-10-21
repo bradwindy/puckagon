@@ -97,9 +97,10 @@ describe('Party Durable Object', () => {
     await guest.until(isRoom((m) => m.phase === 'playing'), 6000);
 
     guest.messages.length = 0;
-    guest.send({ t: 'p', q: [0.3, -0.6] });
+    guest.send({ t: 'p', s: 5, q: [0.3, -0.6] });
     const moved = await guest.until((m): m is SnapMsg => isSnap(m) && Array.isArray(m.m[1]) && Math.abs(m.m[1][0] - 0.3) < 0.01);
     expect(moved.m[1]).toEqual([expect.closeTo(0.3, 2), expect.closeTo(-0.6, 2)]);
+    expect(moved.a).toEqual([-1, 5]);
 
     host.ws.close(1000);
     guest.ws.close(1000);

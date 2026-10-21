@@ -3,10 +3,20 @@ import { CLOSE, MAX_MESSAGE_BYTES, sanitizeName, TICK_HZ, type ClientMsg, type S
 import { MAX_PLAYERS, Room, type RoomSnapshot } from './room';
 
 interface Attachment {
-  pid: string;
+  pid?: string;
   /** The ping the room last showed for this player, kept here so it survives hibernation without a storage write. */
   ping?: number;
+  /** Where the player reaches Cloudflare, for the match-start log. Null when the upgrade request did not say. */
+  colo?: string | null;
+  country?: string | null;
+  /** TCP round trip from the player to their colo in ms. */
+  rtt?: number | null;
 }
+
+/** Headers index.ts fills from Cloudflare's data about the player's connection before forwarding the upgrade. */
+export const NET_HEADERS = { colo: 'x-pk-colo', country: 'x-pk-country', rtt: 'x-pk-rtt' } as const;
+
+const attachment = (ws: WebSocket | undefined): Attachment => (ws?.deserializeAttachment() as Attachment | null) ?? {};
 
 const PID_RE = /^[A-Za-z0-9_-]{16,64}$/;
 const MAX_MESSAGES_PER_SECOND = 90;
@@ -25,6 +35,7 @@ export class Party extends DurableObject<Env> {
   private lastTickAt = 0;
   private budget = new WeakMap<WebSocket, { second: number; count: number }>();
   private saved = '';
+  private colo: Promise<string | null> | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -41,8 +52,8 @@ export class Party extends DurableObject<Env> {
 
     const pings = new Map<string, number>();
     for (const ws of ctx.getWebSockets()) {
-      const att = ws.deserializeAttachment() as Attachment | null;
-      if (!att?.pid || ws.readyState !== WebSocket.OPEN) continue;
+      const att = attachment(ws);
+      if (!att.pid || ws.readyState !== WebSocket.OPEN) continue;
       this.sockets.set(att.pid, ws);
       if (att.ping !== undefined) pings.set(att.pid, att.ping);
     }
@@ -59,6 +70,12 @@ export class Party extends DurableObject<Env> {
     }
     const { 0: client, 1: server } = new WebSocketPair();
     this.ctx.acceptWebSocket(server);
+    const rtt = request.headers.get(NET_HEADERS.rtt);
+    server.serializeAttachment({
+      colo: request.headers.get(NET_HEADERS.colo),
+      country: request.headers.get(NET_HEADERS.country),
+      rtt: rtt === null ? null : Number(rtt),
+    } satisfies Attachment);
     return new Response(null, { status: 101, webSocket: client });
   }
 
@@ -72,7 +89,8 @@ export class Party extends DurableObject<Env> {
     }
     if (typeof msg !== 'object' || msg === null) return;
     this.watchdog();
-    const pid = (ws.deserializeAttachment() as Attachment | null)?.pid;
+    const att = attachment(ws);
+    const pid = att.pid;
 
     if (msg.t === 'hello') {
       if (pid || typeof msg.pid !== 'string' || !PID_RE.test(msg.pid)) return;
@@ -81,7 +99,7 @@ export class Party extends DurableObject<Env> {
         return;
       }
       const previous = this.sockets.get(msg.pid);
-      ws.serializeAttachment({ pid: msg.pid } satisfies Attachment);
+      ws.serializeAttachment({ ...att, pid: msg.pid } satisfies Attachment);
       this.sockets.set(msg.pid, ws);
       if (previous && previous !== ws) this.closeQuietly(previous, CLOSE.replaced, 'Replaced by a newer connection');
       this.room.join(msg.pid, sanitizeName(msg.name) || 'Player');
@@ -92,19 +110,22 @@ export class Party extends DurableObject<Env> {
 
     switch (msg.t) {
       case 'p':
-        this.room.input(pid, msg.q);
+        this.room.input(pid, msg.s, msg.q);
         return;
       case 'rtt': {
         const ping = this.room.reportPing(pid, msg.ms);
-        if (ping !== null) ws.serializeAttachment({ pid, ping } satisfies Attachment);
+        if (ping !== null) ws.serializeAttachment({ ...att, ping } satisfies Attachment);
         return;
       }
       case 'settings':
         this.room.updateSettings(pid, msg.s);
         break;
-      case 'start':
+      case 'start': {
+        const inLobby = this.room.phase === 'lobby';
         this.room.start(pid);
+        if (inLobby && this.room.inMatch) this.logMatchStart();
         break;
+      }
       case 'again':
         this.room.again(pid);
         break;
@@ -129,7 +150,7 @@ export class Party extends DurableObject<Env> {
   }
 
   private async disconnect(ws: WebSocket, quit: boolean): Promise<void> {
-    const pid = (ws.deserializeAttachment() as Attachment | null)?.pid;
+    const pid = attachment(ws).pid;
     if (!pid) return;
     // After waking from hibernation the closing socket is no longer listed, so a missing entry still counts.
     const current = this.sockets.get(pid);
@@ -241,6 +262,27 @@ export class Party extends DurableObject<Env> {
       this.stopLoop();
       this.startLoop();
     }
+  }
+
+  /** Logs where the seated players and this object connect from, to tell whether placing matches nearer players would pay. */
+  private logMatchStart(): void {
+    const seats = this.room.seats;
+    const players = this.room.players
+      .filter((p) => p.seat >= 0)
+      .map((p) => {
+        const att = attachment(this.sockets.get(p.pid));
+        return { bot: p.bot !== null, colo: att.colo ?? null, country: att.country ?? null, rtt: att.rtt ?? null };
+      });
+    void this.serverColo().then((server) => console.log(JSON.stringify({ event: 'match_start', seats, players, server })));
+  }
+
+  /** The colo this object runs in, looked up once per instance. Null when the lookup fails. */
+  private serverColo(): Promise<string | null> {
+    this.colo ??= fetch('https://www.cloudflare.com/cdn-cgi/trace', { signal: AbortSignal.timeout(2000) })
+      .then((res) => res.text())
+      .then((text) => /^colo=(\w+)$/m.exec(text)?.[1] ?? null)
+      .catch(() => null);
+    return this.colo;
   }
 
   private closeQuietly(ws: WebSocket, code: number, reason: string): void {

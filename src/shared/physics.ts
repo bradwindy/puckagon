@@ -183,7 +183,7 @@ export function step(world: World, dt: number): SimEvent[] {
     return { dx, dy, vx: dx / dt, vy: dy / dt };
   });
 
-  const longest = Math.max(Math.hypot(puck.vx, puck.vy) * dt, ...moves.map((mv) => (mv ? Math.hypot(mv.dx, mv.dy) : 0)));
+  const longest = Math.max(Math.hypot(puck.vx, puck.vy) * dt, maxMove);
   const substeps = Math.min(24, Math.max(1, Math.ceil(longest / (r * 0.4))));
   const h = dt / substeps;
   const posts = world.open.map((open, seat) => (open ? goalPosts(layout, seat) : null));

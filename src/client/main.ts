@@ -11,6 +11,7 @@ import { Fx } from './fx';
 import { InputSampler } from './input';
 import { Net, type NetStatus } from './net';
 import { SLOW_MS, UNSTABLE_RATE } from './ping';
+import { predictor } from './predict';
 import { Renderer, type Frame } from './render';
 import { GameState, type Due } from './state';
 import { UI } from './ui';
@@ -136,6 +137,8 @@ class PartySession {
       (msg) => this.onMessage(msg),
       (status) => {
         this.status = status;
+        // A new socket starts with nothing applied, so samples from before it must not count as still to apply.
+        if (status === 'open') this.input.forget();
         ui.update(this.state, status);
       },
     );
@@ -237,33 +240,50 @@ class PartySession {
     renderer.resetTrail();
   }
 
-  frame(now: number, fit: Frame['fit']): Frame | null {
+  /**
+   * Moves your mallet's target to the pointer and samples it, from every frame and every pointer move, so samples keep
+   * coming at 60 Hz when frames drop to 30. Returns your seat while you play, or -1.
+   */
+  steer(now: number): number {
     const st = this.state;
     const room = st.room;
     const layout = st.layout;
-    if (!room || !layout) return null;
-
-    for (const due of st.takeDue(now)) this.handleDue(due);
-    const sample = st.sample(now);
-    if (st.takeServe() && sample?.puck) fx.serve(sample.puck.x, sample.puck.y);
     const me = st.me;
-    const viewSeat = me && me.seat < layout.seats ? me.seat : -1;
+    if (!room || !layout) return -1;
     const active = me && me.seat >= 0 && me.seat < layout.seats && !me.out && room.phase !== 'over' ? me.seat : -1;
-
     if (active >= 0 && this.pointer) {
       const w = renderer.toWorld(this.pointer.x, this.pointer.y);
       this.myMallet = clampToConvex(w, zoneFor(layout, active, room.settings.zone));
     } else if (active < 0) {
       this.myMallet = null;
     }
+    if (active < 0 || !MATCH.includes(room.phase)) return active;
+    // Players who haven't touched the table yet still send samples, from where the server parked their mallet.
+    this.myMallet ??= homePosition(layout, active, room.settings.zone);
+    const batch = this.input.sample(now, this.myMallet);
+    if (batch) this.net.send({ t: 'p', ...batch });
+    return active;
+  }
 
+  frame(now: number, fit: Frame['fit']): Frame | null {
+    const st = this.state;
+    const room = st.room;
+    const layout = st.layout;
+    if (!room || !layout) return null;
+
+    const active = this.steer(now);
     const inMatch = MATCH.includes(room.phase);
-    // Players who haven't touched the table yet still send heartbeats, from where the server parked their mallet.
-    if (inMatch && active >= 0 && !this.myMallet) this.myMallet = homePosition(layout, active, room.settings.zone);
-    if (inMatch && active >= 0 && this.myMallet) {
-      const q = this.input.sample(now, this.myMallet);
-      if (q) this.net.send({ t: 'p', q });
-    }
+    const open = Array.from({ length: layout.seats }, (_, seat) => !st.bySeat(seat)?.out);
+    const predict =
+      inMatch && active >= 0 && this.myMallet
+        ? predictor(this.input, now, { layout, settings: room.settings, seat: active, open, pointer: this.myMallet })
+        : null;
+    const view = st.view(now, predict);
+    if (active >= 0) this.input.prune(st.ack(active));
+    for (const due of view.due) this.handleDue(due);
+    if (view.served && view.puck) fx.serve(view.puck.x, view.puck.y);
+    const me = st.me;
+    const viewSeat = me && me.seat < layout.seats ? me.seat : -1;
     document.body.classList.toggle('aiming', active >= 0);
 
     const live = this.status === 'open' && inMatch;
@@ -285,11 +305,11 @@ class PartySession {
       phase: room.phase,
       mySeat: viewSeat,
       seatPlayers: Array.from({ length: layout.seats }, (_, i) => st.bySeat(i)),
-      puck: inMatch || room.phase === 'over' ? (sample?.puck ?? null) : null,
-      puckSpeed: sample?.speed ?? 0,
-      hitter: sample?.hitter ?? -1,
-      mallets: sample?.mallets ?? [],
-      myMallet: this.myMallet,
+      puck: inMatch || room.phase === 'over' ? view.puck : null,
+      puckSpeed: view.speed,
+      hitter: view.hitter,
+      mallets: view.mallets,
+      myMallet: view.mallet ?? this.myMallet,
       countdown,
       fit,
     };
@@ -314,7 +334,7 @@ const ui = new UI(
     create(name) {
       saveName(name);
       const code = randomCode();
-      history.pushState(null, '', `/p/${code}`);
+      history.pushState(null, '', `/p/${code}${location.search}`);
       enterParty(code, sanitizeName(name));
     },
     join(raw, name) {
@@ -324,7 +344,7 @@ const ui = new UI(
         return;
       }
       saveName(name);
-      history.pushState(null, '', `/p/${code}`);
+      history.pushState(null, '', `/p/${code}${location.search}`);
       enterParty(code, sanitizeName(name));
     },
     enter(name) {
@@ -337,7 +357,7 @@ const ui = new UI(
     addBot: (level) => party?.net.send({ t: 'addBot', level }),
     removeBot: (id) => party?.net.send({ t: 'removeBot', id }),
     leave() {
-      history.pushState(null, '', '/');
+      history.pushState(null, '', `/${location.search}`);
       route();
     },
     mute: () => sfx.toggleMute(),
@@ -400,7 +420,14 @@ canvas.addEventListener('pointerdown', (e) => {
   }
 });
 canvas.addEventListener('pointermove', (e) => {
-  if (party) party.pointer = { x: e.clientX, y: e.clientY };
+  if (!party) return;
+  // Moves the browser merged into this event, with their own times, fill in samples between slow frames.
+  for (const c of e.getCoalescedEvents?.() ?? []) {
+    party.pointer = { x: c.clientX, y: c.clientY };
+    party.steer(c.timeStamp);
+  }
+  party.pointer = { x: e.clientX, y: e.clientY };
+  party.steer(performance.now());
 });
 window.addEventListener('resize', () => renderer.resize());
 window.addEventListener('popstate', route);

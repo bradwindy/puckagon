@@ -13,7 +13,7 @@ function playing(): GameState {
 }
 
 /** Each snapshot carries one wall event that records its tick. */
-const snap = (k: number): SnapMsg => ({ t: 's', k, p: [0, 0, 0, 0], m: [0, 0], h: -1, e: [[1, k, 0, 0.5, -1]] });
+const snap = (k: number): SnapMsg => ({ t: 's', k, p: [0, 0, 0, 0], m: [0, 0], h: -1, e: [[1, k, 0, 0.5, -1]], a: [-1, -1] });
 
 function rng(seed: number): () => number {
   let s = seed;
@@ -41,7 +41,7 @@ function stream(st: GameState, from: number, to: number, extra: (k: number) => n
     for (; next < arrivals.length && arrivals[next] <= now; next++) st.onSnap(snap(from + next), arrivals[next]);
     if (next === 0) continue;
     const tick = st.renderTick(now);
-    const events = st.takeDue(now).map((d) => (d.kind === 'event' ? d.e[1] : -1));
+    const events = st.view(now).due.map((d) => (d.kind === 'event' ? d.e[1] : -1));
     frames.push({ delay: now - BASE_MS - tick * TICK_MS, late: tick > from + next - 1, events });
   }
   return frames;

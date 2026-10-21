@@ -271,7 +271,7 @@ describe('Room input', () => {
     const at = sweep(room, 0.01);
     const moved: number[] = [];
     for (let i = 1; i < 20; i += 2) {
-      room.input('pid-0', [...at(i), ...at(i + 1)]);
+      room.input('pid-0', i, [...at(i), ...at(i + 1)]);
       for (let j = 0; j < 2; j++) {
         const { x, y } = mallet(room);
         tick();
@@ -285,17 +285,54 @@ describe('Room input', () => {
     const { room, tick } = startMatch(['Ann', 'Ben']);
     const at = sweep(room, 0.05);
     const target = () => [mallet(room).tx, mallet(room).ty];
-    room.input('pid-0', [...at(1), ...at(2)]);
-    room.input('pid-0', [...at(3), ...at(4), ...at(5)]);
+    room.input('pid-0', 1, [...at(1), ...at(2)]);
+    room.input('pid-0', 3, [...at(3), ...at(4), ...at(5)]);
     tick();
     expect(target()).toEqual(at(2));
     for (let i = 0; i < 4; i++) tick();
     expect(target()).toEqual(at(5));
-    for (const bad of [[at(1)[0]], [...at(1), ...at(2), ...at(3), ...at(4), ...at(6)], [at(1)[0], NaN], [at(1)[0], '0.1'], 'x']) {
-      room.input('pid-0', bad);
+    const badSamples = [[at(1)[0]], [...at(1), ...at(2), ...at(3), ...at(4), ...at(6)], [at(1)[0], NaN], [at(1)[0], '0.1'], 'x'];
+    const bad = [...badSamples.map((q) => [6, q]), ...[-1, 6.5, Infinity, '6', undefined].map((s) => [s, at(6)])];
+    for (const [s, q] of bad) {
+      room.input('pid-0', s, q);
       tick();
       expect(target()).toEqual(at(5));
     }
+  });
+
+  const lastAcks = (sent: ServerMsg[]) => sent.filter((m): m is SnapMsg => m.t === 's').at(-1)!.a;
+
+  it('acks the last sample applied in every snapshot, skips samples the queue dropped, and starts over on rejoin', () => {
+    const { room, sent, tick } = startMatch(['Ann', 'Ben']);
+    const at = sweep(room, 0.001);
+    tick();
+    expect(lastAcks(sent)).toEqual([-1, -1]);
+
+    const acks: number[] = [];
+    for (let s = 0; s < 40; s += 2) {
+      room.input('pid-0', s, [...at(s), ...at(s + 1)]);
+      for (let j = 0; j < 2; j++) {
+        tick();
+        acks.push(lastAcks(sent)[0]);
+      }
+    }
+    expect(acks).toEqual(acks.map((_, i) => i));
+
+    room.input('pid-0', 40, [...at(40), ...at(41), ...at(42)]);
+    room.input('pid-0', 43, [...at(43), ...at(44), ...at(45)]);
+    acks.length = 0;
+    for (let i = 0; i < 5; i++) {
+      tick();
+      acks.push(lastAcks(sent)[0]);
+    }
+    expect(acks).toEqual([42, 43, 44, 45, 45]);
+
+    room.join('pid-0', 'Ann');
+    tick();
+    expect(lastAcks(sent)).toEqual([-1, -1]);
+    room.input('pid-0', 7, at(7));
+    tick();
+    expect(lastAcks(sent)).toEqual([7, -1]);
   });
 });
 

@@ -1,7 +1,7 @@
 import type { Settings } from './settings';
 
 /** Bump when client and server messages change shape, so stale tabs are told to reload. */
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 export const TICK_HZ = 60;
 export const SNAP_EVERY = 1;
 export const INPUT_HZ = 30;
@@ -11,8 +11,6 @@ export const SAMPLE_HZ = TICK_HZ;
 export const MAX_SAMPLES = 4;
 /** How often clients time a 'ping' against the server's automatic 'pong'. */
 export const PING_MS = 2000;
-/** During a match clients send at least this often, which keeps the room's CPU budget topped up. */
-export const INPUT_HEARTBEAT_MS = 250;
 export const COUNTDOWN_MS = 3000;
 export const SCORED_MS = 1600;
 export const RECONNECT_GRACE_MS = 15000;
@@ -123,6 +121,8 @@ export interface SnapMsg {
   /** last hitter seat */
   h: number;
   e: WireEvent[];
+  /** By seat, the sequence number of the last pointer sample the server applied, or -1 (bots, or none yet). */
+  a: number[];
 }
 
 export type ServerMsg =
@@ -134,8 +134,8 @@ export type ServerMsg =
 
 export type ClientMsg =
   | { t: 'hello'; pid: string; name: string }
-  /** Pointer samples in table units, oldest first, flattened as [x0, y0, x1, y1, ...]. */
-  | { t: 'p'; q: number[] }
+  /** Pointer samples in table units, oldest first, flattened as [x0, y0, x1, y1, ...]. `s` numbers the first sample. */
+  | { t: 'p'; s: number; q: number[] }
   | { t: 'rtt'; ms: number }
   | { t: 'settings'; s: Partial<Settings> }
   | { t: 'start' }

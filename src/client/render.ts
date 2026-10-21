@@ -12,6 +12,7 @@ const LABEL_PAD_X = 0.34;
 const LABEL_PAD_Y = 0.16;
 const TRAIL_S = 0.32;
 const LAG_COLOR = '#ff4d6a';
+const BACKGROUND = '#04050d';
 
 export interface Frame {
   layout: Layout;
@@ -97,7 +98,9 @@ export class Renderer {
   private time = 0;
 
   constructor(private canvas: HTMLCanvasElement) {
-    const ctx = canvas.getContext('2d');
+    // Every frame starts with an opaque fill, so the canvas can be opaque. That lets the low latency path work with
+    // the UI drawn over it, which a transparent canvas can't.
+    const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
     if (!ctx) throw new Error('Canvas 2D is not available');
     this.ctx = ctx;
     this.resize();
@@ -114,6 +117,9 @@ export class Renderer {
     this.canvas.width = Math.round(this.width * this.dpr);
     this.canvas.height = Math.round(this.height * this.dpr);
     this.dots = null;
+    // Resizing clears an opaque canvas to black, which would show until the next frame, or longer while connecting.
+    this.ctx.fillStyle = BACKGROUND;
+    this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
   }
 
   /** Screen (CSS px) to world coordinates using the current view. */
@@ -296,7 +302,7 @@ export class Renderer {
 
   private drawBackground(f: Frame): void {
     const ctx = this.ctx;
-    ctx.fillStyle = '#04050d';
+    ctx.fillStyle = BACKGROUND;
     ctx.fillRect(0, 0, this.width, this.height);
     const hitter = f.seatPlayers[f.hitter];
     const tint = hitter ? PALETTE[hitter.color] : '#3d7bff';

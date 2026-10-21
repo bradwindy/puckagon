@@ -46,6 +46,16 @@ export interface Player {
   bot: BotLevel | null;
 }
 
+interface Sample extends Vec {
+  seq: number;
+}
+
+interface Inputs {
+  queue: Sample[];
+  /** Sequence number of the last sample a tick applied, or -1. */
+  applied: number;
+}
+
 export interface RoomSnapshot {
   phase: Phase;
   settings: Settings;
@@ -93,7 +103,7 @@ export class Room {
   private tickCount = 0;
   private pending: WireEvent[] = [];
   private brains = new Map<string, BotBrain>();
-  private inputs = new Map<string, Vec[]>();
+  private inputs = new Map<string, Inputs>();
   private spots = new Map<number, { k: number; x: number; y: number }[]>();
   /** Last ping shown to the room, by pid. Kept off Player so it is never written to storage. */
   private pings = new Map<string, number>();
@@ -217,6 +227,7 @@ export class Room {
   }
 
   join(pid: string, name: string): Player {
+    this.inputs.delete(pid);
     let p = this.find(pid);
     if (p) {
       p.connected = true;
@@ -309,15 +320,22 @@ export class Room {
     return times.length ? Math.min(...times) : null;
   }
 
-  /** Queues pointer samples, flattened oldest first as [x0, y0, x1, y1, ...]. tick() applies one per step. */
-  input(pid: string, q: unknown): void {
+  /**
+   * Queues pointer samples, flattened oldest first as [x0, y0, x1, y1, ...] and numbered from `s`. tick() applies one per
+   * step and snapshots report the number of the last one applied.
+   */
+  input(pid: string, s: unknown, q: unknown): void {
     const p = this.find(pid);
     if (!this.world || !p || p.seat < 0 || p.out) return;
+    if (typeof s !== 'number' || !Number.isSafeInteger(s) || s < 0) return;
     if (!Array.isArray(q) || q.length % 2 !== 0 || q.length > MAX_SAMPLES * 2 || !q.every(Number.isFinite)) return;
-    const queue = this.inputs.get(pid) ?? [];
+    let inputs = this.inputs.get(pid);
+    if (!inputs) this.inputs.set(pid, (inputs = { queue: [], applied: -1 }));
     const clamp = (n: number) => Math.max(-2, Math.min(2, n));
-    for (let i = 0; i < q.length; i += 2) queue.push({ x: clamp(q[i] as number), y: clamp(q[i + 1] as number) });
-    this.inputs.set(pid, queue.slice(-INPUT_QUEUE));
+    for (let i = 0; i < q.length; i += 2) {
+      inputs.queue.push({ x: clamp(q[i] as number), y: clamp(q[i + 1] as number), seq: s + i / 2 });
+    }
+    inputs.queue = inputs.queue.slice(-INPUT_QUEUE);
   }
 
   /**
@@ -444,9 +462,13 @@ export class Room {
   /** Moves each person's mallet to their next queued sample. With nothing queued it holds its last target. */
   private drivePeople(world: World): void {
     for (const p of this.players) {
-      if (p.bot || p.seat < 0 || p.out) continue;
-      const next = this.inputs.get(p.pid)?.shift();
-      if (next) setTarget(world, p.seat, next);
+      const inputs = this.inputs.get(p.pid);
+      if (p.bot || p.seat < 0 || p.out || !inputs) continue;
+      const next = inputs.queue.shift();
+      if (next) {
+        setTarget(world, p.seat, next);
+        inputs.applied = next.seq;
+      }
     }
   }
 
@@ -454,6 +476,11 @@ export class Room {
     const world = this.world;
     if (!world) return;
     const { puck } = world;
+    const acks = world.mallets.map(() => -1);
+    for (const p of this.players) {
+      const applied = this.inputs.get(p.pid)?.applied;
+      if (p.seat >= 0 && applied !== undefined) acks[p.seat] = applied;
+    }
     this.io.broadcast({
       t: 's',
       k: this.tickCount,
@@ -461,6 +488,7 @@ export class Room {
       m: world.mallets.map((m) => (m ? [round(m.x), round(m.y)] : 0)),
       h: world.lastHitter,
       e: this.pending,
+      a: acks,
     });
     this.pending = [];
   }

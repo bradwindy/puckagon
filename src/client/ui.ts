@@ -1,8 +1,8 @@
 import { MAX_SEATS, MIN_SEATS } from '../shared/geometry';
-import { CODE_LENGTH, NAME_MAX, PALETTE, type BotLevel, type PublicPlayer } from '../shared/protocol';
+import { CODE_LENGTH, NAME_MAX, PALETTE, type BotLevel, type PublicPlayer, type RoomMsg } from '../shared/protocol';
 import { TARGET_MAX, TARGET_MIN, type Settings } from '../shared/settings';
 import type { NetStatus } from './net';
-import { pingLevel } from './ping';
+import { pingLevel, SLOW_MS } from './ping';
 import type { GameState } from './state';
 
 type Child = Node | string | null | undefined | false;
@@ -74,6 +74,12 @@ function showPing(tag: HTMLElement, p: PublicPlayer): void {
   tag.textContent = known ? `${p.ping} ms` : '';
 }
 
+/** Suggests the settings that hide lag best while someone's ping is high, unless the host already picked them. */
+function showLagHint(hint: HTMLElement, room: RoomMsg): void {
+  const laggy = room.players.some((p) => !p.bot && p.connected && p.ping >= SLOW_MS);
+  hint.classList.toggle('hidden', !laggy || (room.settings.speed === 'chill' && room.settings.mallet === 'L'));
+}
+
 /** Wide screens and landscape phones put the lobby beside the table instead of under it. Matches style.css. */
 const sidePanel = () => window.matchMedia('(min-width: 820px), (orientation: landscape) and (min-width: 640px)').matches;
 
@@ -88,6 +94,8 @@ export class UI {
   private lastPanelKey = '';
   /** Lobby ping tags by player id, updated in place so a ping change never rebuilds the panel under a tap. */
   private pingTags = new Map<string, HTMLElement>();
+  /** The lobby's high ping hint, shown and hidden in place for the same reason. */
+  private lagHint: HTMLElement | null = null;
 
   constructor(
     private root: HTMLElement,
@@ -318,11 +326,13 @@ export class UI {
         const tag = this.pingTags.get(p.id);
         if (tag) showPing(tag, p);
       }
+      if (this.lagHint) showLagHint(this.lagHint, room);
       return;
     }
     this.lastPanelKey = key;
 
     this.pingTags.clear();
+    this.lagHint = null;
     if (room.phase === 'lobby') this.renderLobby(state);
     else if (room.phase === 'over') this.renderOver(state);
     else this.renderPlaying(state);
@@ -396,6 +406,9 @@ export class UI {
       ),
     );
 
+    this.lagHint = h('p', { class: 'muted small-hint' }, 'High ping here. Chill speed and L mallets help.');
+    showLagHint(this.lagHint, room);
+
     const canStart = host && ready >= MIN_SEATS;
     const startLabel = host
       ? ready < MIN_SEATS
@@ -425,8 +438,9 @@ export class UI {
             ),
           ),
         ),
-      host && ready < MIN_SEATS && h('p', { class: 'muted hint-solo' }, 'Share the link, or add a bot to play solo.'),
+      host && ready < MIN_SEATS && h('p', { class: 'muted small-hint' }, 'Share the link, or add a bot to play solo.'),
       h('h2', {}, host ? 'Settings' : 'Settings (host picks)'),
+      this.lagHint,
       this.segmented('Scoring', MODE, s.mode, host, (mode) => set({ mode })),
       stepper,
       this.segmented('Mallet zone', ZONE, s.zone, host, (zone) => set({ zone })),

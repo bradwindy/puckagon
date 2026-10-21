@@ -1,6 +1,7 @@
 import { makeLayout, type Layout } from '../shared/geometry';
 import { SNAP_EVERY, TICK_HZ, type GoalInfo, type PublicPlayer, type RoomMsg, type SnapMsg, type WireEvent } from '../shared/protocol';
 import type { Vec } from '../shared/vec';
+import type { Prediction, PuckState } from './predict';
 
 const TICK_MS = 1000 / TICK_HZ;
 const SNAP_MS = SNAP_EVERY * TICK_MS;
@@ -32,24 +33,62 @@ const LATE_MS = 1000;
  * background doesn't replay them all at once. It allows for the longest delay.
  */
 const STALE_TICKS = Math.ceil((SNAP_MS + MAX_MARGIN_MS) / TICK_MS) + 10;
+/** While the puck's timeline moves toward local time or back, the puck looks at most this much faster or slower, in units a second. */
+const WARP_SPEED = 0.6;
+const MAX_RATE = 3;
+const MIN_RATE = 0.4;
+/** How far outside every other mallet's reach the predicted puck must stay to be drawn in local time, and the extra it needs to go there. */
+const SAFE_MARGIN = 0.02;
+const SAFE_ENTER = 0.05;
+/** Time constant of the offset that hides corrections to the predicted puck. A bigger correction is a jump. */
+const CORRECTION_MS = 80;
+const MAX_CORRECTION = 0.5;
+/** A server event is the same as a shown predicted one of its kind and seat this many ticks either side. */
+const MATCH_TICKS = 3;
+/** How long shown events are remembered, so a late server copy of a predicted one is still recognised. */
+const MEMORY_TICKS = 60;
+/** The room's rules for which events reach clients (see room.ts), applied to predicted ones. */
+const HIT_EVENT_GAP = 4;
+const SAME_SPOT = 0.02;
+const SAME_SPOT_TICKS = 30;
 
 const clamp = (n: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, n));
 
-interface Snap {
+export interface Snap {
   k: number;
   puck: [number, number, number, number];
   mallets: ([number, number] | 0)[];
   hitter: number;
+  /** By seat, the sequence number of the last pointer sample the server applied, or -1. */
+  acks: number[];
 }
 
-export interface Sample {
+/** Predicts from a snapshot with your input as it is now. `live` says whether the puck is in play at that snapshot. */
+export type Predictor = (snap: Snap, live: boolean) => Prediction | null;
+
+export interface View {
   puck: Vec | null;
   speed: number;
   mallets: (Vec | null)[];
   hitter: number;
+  /** Your mallet in local time, when there is a prediction. */
+  mallet: Vec | null;
+  due: Due[];
+  /** True once per serve, on the first frame the served puck is visible. */
+  served: boolean;
 }
 
 export type Due = { kind: 'event'; e: WireEvent } | { kind: 'goal'; goal: GoalInfo };
+
+interface Fired {
+  k: number;
+  e: WireEvent;
+  predicted: boolean;
+  /** A predicted event the server has since confirmed. */
+  matched: boolean;
+  /** Last tick this spot was touched, which keeps a held puck quiet. */
+  seen: number;
+}
 
 export class GameState {
   room: RoomMsg | null = null;
@@ -65,10 +104,26 @@ export class GameState {
   private sampledAt = -Infinity;
   private shownTick = -Infinity;
   private queue: { k: number; due: Due }[] = [];
-  /** The puck is hidden for render ticks in [hiddenFrom, showFrom): from a goal until the next serve. */
+  /** The puck is hidden for display ticks in [hiddenFrom, showFrom): from a goal until the next serve. */
   private hiddenFrom = Infinity;
   private showFrom = Infinity;
-  private served = false;
+  /** The last frame hid the puck at a predicted goal. */
+  private guessedGoal = false;
+  /**
+   * The tick the puck is drawn at. It runs between the interpolated past and local time, never goes back, and moves
+   * between the two slowly enough that the puck never jumps.
+   */
+  private puckTick = -Infinity;
+  private viewedAt = -Infinity;
+  private ahead = false;
+  /** What the last frame drew the puck from. */
+  private base: { snap: Snap; live: boolean; predicted: boolean; lead: Prediction | null } | null = null;
+  /** Added to the drawn puck so a correction from a new snapshot fades in instead of jumping. */
+  private offsetX = 0;
+  private offsetY = 0;
+  private fired: Fired[] = [];
+  /** Recent ticks the puck was drawn past in local time, ahead of the snapshots. */
+  private guessed: number[] = [];
 
   get me(): PublicPlayer | undefined {
     return this.room?.players.find((p) => p.id === this.myId);
@@ -87,6 +142,11 @@ export class GameState {
     return this.late;
   }
 
+  /** The sequence number of the last sample the server applied for a seat, as of the newest snapshot. */
+  ack(seat: number): number {
+    return this.snaps.at(-1)?.acks[seat] ?? -1;
+  }
+
   private resetClock(): void {
     this.snaps = [];
     this.queue = [];
@@ -96,6 +156,13 @@ export class GameState {
     this.delay = START_DELAY_MS;
     this.late = 0;
     this.shownTick = -Infinity;
+    this.puckTick = -Infinity;
+    this.viewedAt = -Infinity;
+    this.ahead = false;
+    this.base = null;
+    this.offsetX = this.offsetY = 0;
+    this.fired = [];
+    this.guessed = [];
   }
 
   onRoom(msg: RoomMsg): void {
@@ -117,13 +184,6 @@ export class GameState {
       // The serve happens on the tick after the last snap we have, and shows up in the next snap.
       this.showFrom = (this.snaps.at(-1)?.k ?? 0) + SNAP_EVERY;
     }
-  }
-
-  /** True once per serve, on the first frame the served puck is visible. */
-  takeServe(): boolean {
-    const served = this.served;
-    this.served = false;
-    return served;
   }
 
   onSnap(msg: SnapMsg, now: number): void {
@@ -153,21 +213,22 @@ export class GameState {
     const step = SLEW * Math.min(MAX_SLEW_GAP_MS, now - (prevAt ?? now));
     this.offset = prevAt === undefined || reanchor ? min : this.offset + clamp(min - this.offset, -step, step);
     this.delay += clamp(target - this.delay, -step, step);
-    this.snaps.push({ k: msg.k, puck: msg.p, mallets: msg.m, hitter: msg.h });
+    this.snaps.push({ k: msg.k, puck: msg.p, mallets: msg.m, hitter: msg.h, acks: msg.a });
     if (this.snaps.length > 40) this.snaps.shift();
-    for (const e of msg.e) this.queue.push({ k: msg.k, due: { kind: 'event', e } });
+    for (const e of msg.e) this.arrive(msg.k, e);
   }
 
   onGoal(k: number, goal: GoalInfo): void {
     this.queue.push({ k, due: { kind: 'goal', goal } });
-    // Set on arrival rather than when due, so a later serve message always wins even if frames were paused.
-    this.hiddenFrom = k;
+    // Set on arrival rather than when due, so a later serve message always wins even if frames were paused. A puck
+    // already hidden at a predicted goal stays hidden.
+    this.hiddenFrom = this.guessedGoal ? Math.min(k, this.puckTick) : k;
     this.showFrom = Infinity;
   }
 
   /**
-   * The server tick on screen. It never goes back, so when the clock re-anchors or slews back the puck pauses instead
-   * of rewinding.
+   * The interpolated past: the server tick other mallets are drawn at. It never goes back, so when the clock re-anchors
+   * or slews back they pause instead of rewinding.
    */
   renderTick(now: number): number {
     if (!Number.isFinite(this.offset)) return 0;
@@ -175,71 +236,205 @@ export class GameState {
     return this.shownTick;
   }
 
-  /** Events whose tick the rendered timeline has reached. */
-  takeDue(now: number): Due[] {
-    const tick = this.renderTick(now);
-    const newest = this.snaps.at(-1)?.k ?? 0;
-    const due: Due[] = [];
-    this.queue = this.queue.filter((q) => {
-      if (q.k > tick) return true;
-      if (newest - q.k <= STALE_TICKS) due.push(q.due);
-      return false;
-    });
-    return due;
-  }
+  /**
+   * Everything one frame draws. With a predictor the puck runs ahead into local time while no other mallet can reach it,
+   * and your mallet is drawn in local time.
+   */
+  view(now: number, predict: Predictor | null = null): View {
+    const newest = this.snaps.at(-1);
+    if (!newest) return { puck: null, speed: 0, mallets: [], hitter: -1, mallet: null, due: [], served: false };
+    const past = this.renderTick(now);
+    const dt = Number.isFinite(this.viewedAt) ? Math.max(0, now - this.viewedAt) : 0;
+    this.viewedAt = now;
+    const phase = this.room?.phase;
+    const live = phase === 'playing' && this.visibleAt(newest.k);
+    // While acks stop coming, keep drawing from the last prediction instead of falling back to a stale snapshot.
+    const pred = predict?.(newest, live) ?? (predict && live && this.base?.snap === newest ? this.base.lead : null);
+    const lead = pred && pred.puck.length > 0 ? pred : null;
 
-  sample(now: number): Sample | null {
-    const snaps = this.snaps;
-    if (snaps.length === 0) return null;
-    const tick = this.renderTick(now);
-    let a = snaps[0];
-    let b = snaps[0];
-    for (let i = snaps.length - 1; i >= 0; i--) {
-      if (snaps[i].k <= tick) {
-        a = snaps[i];
-        b = snaps[i + 1] ?? snaps[i];
-        break;
-      }
+    const from = Number.isFinite(this.puckTick) ? this.puckTick : past;
+    this.puckTick = this.advance(from, past, newest, lead, dt / TICK_MS);
+    const tick = this.puckTick;
+
+    const decay = Math.exp(-dt / CORRECTION_MS);
+    this.offsetX *= decay;
+    this.offsetY *= decay;
+    const base = this.base;
+    if (base && (base.predicted || lead) && (base.snap !== newest || base.predicted !== !!lead)) {
+      // Your own input is the same in both, so only what the server changed is smoothed.
+      const old = base.predicted ? (predict?.(base.snap, base.live) ?? base.lead) : null;
+      const was = this.puckAt(tick, base.snap, old && old.puck.length > 0 ? old : null);
+      const is = this.puckAt(tick, newest, lead);
+      this.offsetX += was.x - is.x;
+      this.offsetY += was.y - is.y;
     }
+    this.base = { snap: newest, live, predicted: !!lead, lead };
 
-    const span = b.k - a.k;
-    const t = span > 0 ? Math.min(1, Math.max(0, (tick - a.k) / span)) : 0;
-    const jump = Math.hypot(b.puck[0] - a.puck[0], b.puck[1] - a.puck[1]) > TELEPORT;
-    let px: number;
-    let py: number;
-    if (span > 0 && !jump) {
-      px = a.puck[0] + (b.puck[0] - a.puck[0]) * t;
-      py = a.puck[1] + (b.puck[1] - a.puck[1]) * t;
-    } else {
-      const extra = Math.min(MAX_EXTRAPOLATE_MS, Math.max(0, (tick - a.k) * TICK_MS)) / 1000;
-      const base = jump && t >= 1 ? b : a;
-      px = base.puck[0] + (jump ? 0 : base.puck[2] * extra);
-      py = base.puck[1] + (jump ? 0 : base.puck[3] * extra);
-    }
-
-    const mallets = a.mallets.map((ma, seat) => {
-      const mb = b.mallets[seat];
-      if (!ma) return null;
-      if (!mb || span === 0) return { x: ma[0], y: ma[1] };
-      return { x: ma[0] + (mb[0] - ma[0]) * t, y: ma[1] + (mb[1] - ma[1]) * t };
-    });
-
+    let served = false;
     if (tick >= this.showFrom) {
       this.hiddenFrom = this.showFrom = Infinity;
-      this.served = true;
+      served = true;
     }
-    const phase = this.room?.phase;
+    this.guessedGoal = !!lead && tick >= lead.goal;
+    const hidden = phase === 'countdown' || (tick >= this.hiddenFrom && tick < this.showFrom) || this.guessedGoal;
+    if (hidden || served || Math.hypot(this.offsetX, this.offsetY) > MAX_CORRECTION) this.offsetX = this.offsetY = 0;
+
+    const due = this.fire(from, tick, newest.k, lead);
+
     if (phase === 'countdown' || phase === 'playing' || phase === 'scored') {
-      const late = tick > snaps[snaps.length - 1].k ? 1 : 0;
+      const late = past > newest.k ? 1 : 0;
       this.late += (late - this.late) * (1 - Math.exp(-Math.max(0, now - this.sampledAt) / LATE_MS));
     }
     this.sampledAt = now;
-    const hidden = phase === 'countdown' || (tick >= this.hiddenFrom && tick < this.showFrom);
+    const state = this.puckAt(tick, newest, lead);
     return {
-      puck: hidden ? null : { x: px, y: py },
-      speed: Math.hypot(a.puck[2], a.puck[3]),
-      mallets,
-      hitter: a.hitter,
+      puck: hidden ? null : { x: state.x + this.offsetX, y: state.y + this.offsetY },
+      speed: Math.hypot(state.vx, state.vy),
+      mallets: this.malletsAt(past),
+      hitter: state.hitter,
+      mallet: pred?.mallet ?? null,
+      due,
+      served,
     };
+  }
+
+  private visibleAt(k: number): boolean {
+    return k < this.hiddenFrom || k >= this.showFrom;
+  }
+
+  /**
+   * Moves the puck's tick toward local time when the predicted path stays out of every other mallet's reach, and back
+   * toward the past otherwise. The rate limit keeps the change in the puck's apparent speed under WARP_SPEED.
+   */
+  private advance(from: number, past: number, newest: Snap, lead: Prediction | null, ticks: number): number {
+    const speedAt = (t: number) => {
+      const s = this.puckAt(t, newest, lead);
+      return Math.hypot(s.vx, s.vy);
+    };
+    // The puck may speed up within the frame, so the limits hold for the faster end of it.
+    const speed = Math.max(speedAt(from), speedAt(from + MAX_RATE * ticks));
+    const fast = Math.min(MAX_RATE, 1 + WARP_SPEED / speed);
+    const slow = Math.max(MIN_RATE, 1 - WARP_SPEED / speed);
+    const need = SAFE_MARGIN + (this.ahead ? 0 : SAFE_ENTER);
+    // The first state is the snapshot itself, which no mallet can change.
+    this.ahead = !!lead && lead.clear.every((c, i) => i === 0 || c > need);
+    const target = this.ahead ? lead!.L : past;
+    const next = clamp(target, from + (this.ahead ? slow : MIN_RATE) * ticks, from + fast * ticks);
+    // When local time steps back a tick the puck carries on slowly into the extra predicted ticks instead of stopping.
+    const top = lead ? Math.max(past, Math.min(lead.puck.at(-1)!.t, Math.max(lead.L, from + slow * ticks))) : Infinity;
+    return Math.max(from, clamp(next, past, top));
+  }
+
+  /** The events of every tick the puck's timeline crossed this frame: the server's up to the newest snapshot, predicted ones after it. */
+  private fire(from: number, to: number, newest: number, lead: Prediction | null): Due[] {
+    const due: Due[] = [];
+    this.queue = this.queue.filter((q) => {
+      if (q.k > to) return true;
+      if (newest - q.k <= STALE_TICKS) {
+        due.push(q.due);
+        if (q.due.kind === 'event') this.fired.push({ k: q.k, e: q.due.e, predicted: false, matched: false, seen: q.k });
+      }
+      return false;
+    });
+    if (lead) {
+      const end = Math.min(to, lead.puck.at(-1)!.t);
+      for (let k = Math.max(Math.floor(from), newest) + 1; k <= end; k++) this.guessed.push(k);
+      for (const { k, e } of lead.events) {
+        if (k <= from || k > to || (e[0] === 0 && e[4] !== lead.seat) || this.quiet(k, e)) continue;
+        due.push({ kind: 'event', e });
+        this.fired.push({ k, e, predicted: true, matched: false, seen: k });
+      }
+    }
+    const keep = to - Math.max(SAME_SPOT_TICKS, MEMORY_TICKS);
+    this.fired = this.fired.filter((f) => f.seen > keep);
+    this.guessed = this.guessed.filter((k) => k > keep);
+    return due;
+  }
+
+  /** Queues a server event, unless a predicted one already showed it, or its tick was shown in local time too long ago. */
+  private arrive(k: number, e: WireEvent): void {
+    const twin = this.fired.find(
+      (f) => f.predicted && !f.matched && f.e[0] === e[0] && f.e[4] === e[4] && Math.abs(f.k - k) <= MATCH_TICKS,
+    );
+    if (twin) {
+      twin.matched = true;
+      return;
+    }
+
+    this.queue.push({ k, due: { kind: 'event', e } });
+  }
+
+  /** True for a predicted event a client wouldn't get from the server, or one the server already sent. */
+  private quiet(k: number, e: WireEvent): boolean {
+    for (const f of this.fired) {
+      if (f.e[4] !== e[4]) continue;
+      if (!f.predicted && f.e[0] === e[0] && Math.abs(f.k - k) <= MATCH_TICKS) return true;
+      if (k - f.seen < SAME_SPOT_TICKS && Math.hypot(f.e[1] - e[1], f.e[2] - e[2]) < SAME_SPOT) {
+        f.seen = k;
+        return true;
+      }
+      if (e[0] === 0 && k - f.k < HIT_EVENT_GAP) return true;
+    }
+    return false;
+  }
+
+  /** The puck at a tick: from snapshots up to `base`, then from the prediction made from it, extrapolating a little past both. */
+  private puckAt(t: number, base: Snap, lead: Prediction | null): PuckState {
+    if (!lead || t <= base.k) return this.snapAt(t, base.k);
+    const s = lead.puck;
+    const end = s[s.length - 1];
+    if (t >= end.t) {
+      const extra = Math.min(MAX_EXTRAPOLATE_MS, (t - end.t) * TICK_MS) / 1000;
+      return { ...end, t, x: end.x + end.vx * extra, y: end.y + end.vy * extra };
+    }
+    let i = 0;
+    while (i < s.length - 2 && s[i + 1].t <= t) i++;
+    const a = s[i];
+    const b = s[i + 1] ?? a;
+    const f = b.t > a.t ? clamp((t - a.t) / (b.t - a.t), 0, 1) : 0;
+    return {
+      t,
+      x: a.x + (b.x - a.x) * f,
+      y: a.y + (b.y - a.y) * f,
+      vx: a.vx + (b.vx - a.vx) * f,
+      vy: a.vy + (b.vy - a.vy) * f,
+      hitter: f < 1 ? a.hitter : b.hitter,
+    };
+  }
+
+  /** The puck at a tick from the snapshots up to tick `upTo`, extrapolating a little past them. */
+  private snapAt(t: number, upTo: number): PuckState {
+    const snaps = this.snaps;
+    let i = snaps.length - 1;
+    while (i > 0 && (snaps[i].k > t || snaps[i].k > upTo)) i--;
+    const a = snaps[i];
+    const b = snaps[i + 1] && snaps[i + 1].k <= upTo ? snaps[i + 1] : a;
+    const span = b.k - a.k;
+    const f = span > 0 ? clamp((t - a.k) / span, 0, 1) : 0;
+    const jump = Math.hypot(b.puck[0] - a.puck[0], b.puck[1] - a.puck[1]) > TELEPORT;
+    const [ax, ay, avx, avy] = a.puck;
+    if (span > 0 && !jump) {
+      return { t, x: ax + (b.puck[0] - ax) * f, y: ay + (b.puck[1] - ay) * f, vx: avx, vy: avy, hitter: a.hitter };
+    }
+    const extra = Math.min(MAX_EXTRAPOLATE_MS, Math.max(0, (t - a.k) * TICK_MS)) / 1000;
+    const c = jump && f >= 1 ? b : a;
+    const [x, y, vx, vy] = c.puck;
+    return { t, x: x + (jump ? 0 : vx * extra), y: y + (jump ? 0 : vy * extra), vx, vy, hitter: c.hitter };
+  }
+
+  private malletsAt(t: number): (Vec | null)[] {
+    const snaps = this.snaps;
+    let i = snaps.length - 1;
+    while (i > 0 && snaps[i].k > t) i--;
+    const a = snaps[i];
+    const b = snaps[i + 1] ?? a;
+    const span = b.k - a.k;
+    const f = span > 0 ? clamp((t - a.k) / span, 0, 1) : 0;
+    return a.mallets.map((ma, seat) => {
+      const mb = b.mallets[seat];
+      if (!ma) return null;
+      if (!mb || span === 0) return { x: ma[0], y: ma[1] };
+      return { x: ma[0] + (mb[0] - ma[0]) * f, y: ma[1] + (mb[1] - ma[1]) * f };
+    });
   }
 }
