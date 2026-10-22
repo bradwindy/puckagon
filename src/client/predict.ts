@@ -35,6 +35,8 @@ export interface Prediction {
   k: number;
   /** Local time: the tick your current pointer will reach the host. */
   L: number;
+  /** How many of your oldest unacked samples were left out to stay within maxL. */
+  skipped: number;
   /** Puck states from tick k to a little past L. Empty when the puck is not in play. */
   puck: PuckState[];
   /** Predicted events as the host would send them, each at the tick it falls in. */
@@ -62,6 +64,11 @@ export interface PredictInput {
   applied: Vec | null;
   /** Your samples after it, oldest first, one per tick. */
   next: Vec[];
+  /**
+   * Samples that would land a whole tick or more past this local time are left out, oldest first. The host skips the
+   * older samples of a late burst, so counting them would carry local time past where it ends up.
+   */
+  maxL?: number;
   /** Where the pointer puts your mallet now, and how far now is into the next sample interval, 0 to 1. */
   pointer: Vec;
   frac: number;
@@ -77,7 +84,10 @@ function wire(e: Exclude<SimEvent, { k: 'goal' }>): WireEvent {
  */
 export function predict(input: PredictInput): Prediction | null {
   const { layout, seat, snap } = input;
-  if (!snap.mallets[seat]) return null;
+  if (!snap.mallets[seat] || input.next.length > MAX_UNACKED) return null;
+  const keep = Math.max(0, Math.ceil((input.maxL ?? Infinity) - snap.k));
+  const skipped = Math.max(0, input.next.length - keep);
+  const next = input.next.slice(skipped);
   const world = createWorld(layout, input.settings);
   world.open = [...input.open];
   world.mallets = snap.mallets.map((m) => (m ? { x: m[0], y: m[1], tx: m[0], ty: m[1] } : null));
@@ -87,7 +97,7 @@ export function predict(input: PredictInput): Prediction | null {
   world.lastHitter = snap.hitter;
   world.frozen = !input.live;
 
-  const out: Prediction = { seat, k: snap.k, L: snap.k, puck: [], events: [], goal: Infinity, mallet: { x: 0, y: 0 }, mallets: [], steps: [] };
+  const out: Prediction = { seat, k: snap.k, L: snap.k, skipped, puck: [], events: [], goal: Infinity, mallet: { x: 0, y: 0 }, mallets: [], steps: [] };
   const record = (t: number) => {
     out.steps.push({ t, mallets: world.mallets.map((m) => (m ? { x: m.x, y: m.y } : null)) });
     if (!input.live) return;
@@ -114,8 +124,8 @@ export function predict(input: PredictInput): Prediction | null {
   };
 
   record(snap.k);
-  input.next.forEach((s, i) => advance(s, DT, snap.k + i + 1));
-  out.L = snap.k + input.next.length;
+  next.forEach((s, i) => advance(s, DT, snap.k + i + 1));
+  out.L = snap.k + next.length;
   if (input.frac > MIN_FRAC) {
     out.L += input.frac;
     advance(input.pointer, input.frac * DT, out.L);
@@ -127,16 +137,15 @@ export function predict(input: PredictInput): Prediction | null {
   return out;
 }
 
-/** Predicts for `seat` from any snapshot, with the samples the host had still to apply at it and the pointer now. */
+/** Predicts for `seat` from any snapshot up to `maxL`, with the samples the host had still to apply at it and the pointer now. */
 export function predictor(
   input: InputSampler,
   now: number,
-  base: Omit<PredictInput, 'snap' | 'live' | 'applied' | 'next' | 'frac'>,
+  base: Omit<PredictInput, 'snap' | 'live' | 'applied' | 'next' | 'frac' | 'maxL'>,
 ): Predictor {
   const frac = input.frac(now);
-  return (snap, live) => {
+  return (snap, live, maxL) => {
     const { applied, next } = input.since(snap.acks[base.seat] ?? -1);
-    if (next.length > MAX_UNACKED) return null;
-    return predict({ ...base, snap, live, applied, next, frac });
+    return predict({ ...base, snap, live, applied, next, frac, maxL });
   };
 }
