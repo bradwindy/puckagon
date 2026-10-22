@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { predict, type Prediction, type PuckState } from '../src/client/predict';
-import { GameState, type Predictor, type Snap } from '../src/client/state';
+import { InputSampler } from '../src/client/input';
+import { predict, predictor, type Prediction, type PuckState } from '../src/client/predict';
+import { GameState, mergeRoom, type Predictor, type Snap } from '../src/client/state';
 import { Match } from '../src/host/match';
-import { makeLayout } from '../src/shared/geometry';
-import { TICK_HZ, type HostMsg, type RoomMsg, type SnapMsg, type WireEvent } from '../src/shared/protocol';
+import { homePosition, makeLayout } from '../src/shared/geometry';
+import { COUNTDOWN_MS, MATCH_PHASES, TICK_HZ, type HostMsg, type RoomMsg, type SnapMsg, type WireEvent } from '../src/shared/protocol';
 import { DEFAULT_SETTINGS } from '../src/shared/settings';
 
 const TICK_MS = 1000 / TICK_HZ;
@@ -120,7 +121,7 @@ function snap(k: number): SnapMsg {
 function line(s: Snap, lead: number, events: { k: number; e: WireEvent }[] = []): Prediction {
   const L = s.k + lead;
   const puck = Array.from({ length: lead + 3 }, (_, i) => state(s.k + i));
-  return { seat: 0, k: s.k, L, puck, events: events.filter((e) => e.k > s.k), goal: Infinity, mallet: { x: 0, y: 0.7 }, mallets: [], steps: puck.map((p) => ({ t: p.t, mallets: [] })) };
+  return { seat: 0, k: s.k, L, skipped: 0, puck, events: events.filter((e) => e.k > s.k), goal: Infinity, mallet: { x: 0, y: 0.7 }, mallets: [], steps: puck.map((p) => ({ t: p.t, mallets: [] })) };
 }
 
 interface Frame {
@@ -194,6 +195,81 @@ describe('display timeline', () => {
     expect(Math.abs(at(240).local - at(240).tick)).toBeLessThan(0.01);
     expect(Math.abs(at(390).local - at(390).tick)).toBeLessThan(0.01);
     expect(Math.abs(at(500).local - at(500).tick)).toBeLessThan(0.01);
+  });
+
+  it.each([
+    ['to the host', false],
+    ['both ways', true],
+  ])('keeps a steady speed through a 150 ms stall on the link %s', (_, both) => {
+    const LINK_MS = 25;
+    const STALL_AT = COUNTDOWN_MS + 2000;
+    const STALL_MS = 150;
+    const settings = DEFAULT_SETTINGS;
+    const layout = makeLayout(2, settings);
+    let now = 0;
+    let inbox: { at: number; run: () => void }[] = [];
+    // What would arrive during the stall comes all at once when it ends, as when a Wi-Fi radio was busy elsewhere.
+    const send = (stalls: boolean, run: () => void) => {
+      const at = now + LINK_MS;
+      inbox.push({ at: stalls && at >= STALL_AT && at < STALL_AT + STALL_MS ? STALL_AT + STALL_MS : at, run });
+    };
+    const party: RoomMsg = { ...ROOM, phase: 'countdown', settings, v: 0 };
+    const st = new GameState();
+    st.onRoom(party);
+    const match = new Match(
+      {
+        send: (msg) =>
+          send(both, () => {
+            if (msg.t === 's') st.onSnap(msg, now);
+            if (msg.t === 'match') st.onRoom(mergeRoom(party, msg));
+          }),
+        report: () => {},
+        random: () => 0.5,
+      },
+      {
+        match: ROOM.match,
+        settings,
+        seats: 2,
+        players: [
+          { id: 'me', seat: 0, bot: null },
+          { id: 'you', seat: 1, bot: null },
+        ],
+        host: 'me',
+        linked: ['you'],
+      },
+      0,
+    );
+    const input = new InputSampler();
+    const pointer = homePosition(layout, 1, settings.zone);
+    const frames: { now: number; tick: number }[] = [];
+    let hostAt = TICK_MS;
+    let frameAt = 5;
+    for (; now < STALL_AT + 2000; now++) {
+      for (; hostAt <= now; hostAt += TICK_MS) {
+        const serving = match.phase !== 'playing';
+        match.tick(now);
+        // A puck at rest stays in play, so nothing but the stall changes the timeline.
+        if (serving && match.phase === 'playing') match.world!.puck = { x: 0, y: 0, vx: 0, vy: 0 };
+      }
+      const due = inbox.filter((m) => m.at <= now);
+      inbox = inbox.filter((m) => m.at > now);
+      for (const m of due) m.run();
+      if (now < frameAt || !MATCH_PHASES.includes(st.room!.phase)) continue;
+      frameAt += TICK_MS;
+      const batch = input.sample(now, pointer, st.ack(1));
+      if (batch) send(true, () => match.input('you', batch.s, batch.q));
+      const v = st.view(now, predictor(input, now, { layout, settings, seat: 1, open: [true, true], pointer }));
+      input.prune(st.ack(1));
+      if (v.tick !== null && st.room!.phase === 'playing') frames.push({ now, tick: v.tick });
+    }
+
+    const ahead = (f: { now: number; tick: number }) => f.tick - f.now / TICK_MS;
+    const before = ahead(frames.filter((f) => f.now < STALL_AT).at(-1)!);
+    const after = frames.filter((f) => f.now >= STALL_AT);
+    const slow = after.filter((f, i) => i > 0 && f.tick - after[i - 1].tick < (0.9 * (f.now - after[i - 1].now)) / TICK_MS);
+    // Counting every late sample, the puck ran 7 or 8 ticks ahead and then played slow for about 650 ms.
+    expect(Math.max(...after.map(ahead)) - before).toBeLessThan(3);
+    expect(slow.length * TICK_MS).toBeLessThan(250);
   });
 
   it('with ?ahead= draws no further ahead of the server than asked', () => {

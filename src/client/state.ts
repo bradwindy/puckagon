@@ -57,6 +57,14 @@ const MAX_CORRECTION = 0.5;
 const MATCH_TICKS = 3;
 /** How long shown events are remembered, so a late host copy of a predicted one is still recognised. */
 const MEMORY_TICKS = 60;
+/** Local time's smallest lead on this page's clock over this long is its usual lead. */
+const LEAD_MS = 2000;
+/**
+ * Local time may run this many ticks past its usual lead, plus up to a tick more from counting whole samples, which
+ * allows for the host's queue holding a sample more. Further past it, the host is catching up after a stall and skips
+ * or drains the older samples, so they are left out.
+ */
+const LEAD_SLACK = 1;
 
 const clamp = (n: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, n));
 
@@ -91,8 +99,11 @@ export interface Snap {
   motion: ([number, number] | 0)[];
 }
 
-/** Predicts from a snapshot with your input as it is now. `live` says whether the puck is in play at that snapshot. */
-export type Predictor = (snap: Snap, live: boolean) => Prediction | null;
+/**
+ * Predicts from a snapshot with your input as it is now, up to local time `maxL`. `live` says whether the puck is in
+ * play at that snapshot.
+ */
+export type Predictor = (snap: Snap, live: boolean, maxL: number) => Prediction | null;
 
 export interface View {
   puck: Vec | null;
@@ -154,6 +165,8 @@ export class GameState {
   private fired: Fired[] = [];
   /** Recent ticks the puck was drawn past in local time, ahead of the snapshots. */
   private guessed: number[] = [];
+  /** Local time less this page's clock, in ticks, in recent frames, counting every unacked sample. */
+  private leads: { at: number; ticks: number }[] = [];
 
   get me(): PublicPlayer | undefined {
     return this.room?.players.find((p) => p.id === this.myId);
@@ -193,6 +206,7 @@ export class GameState {
     this.malletOffsets = [];
     this.fired = [];
     this.guessed = [];
+    this.leads = [];
   }
 
   onRoom(msg: RoomMsg): void {
@@ -298,8 +312,18 @@ export class GameState {
     this.viewedAt = now;
     const phase = this.room?.phase;
     const live = phase === 'playing' && this.visibleAt(newest.k);
+    // Counting every unacked sample, a stall on the way to the host would carry local time ahead, and it would fall back
+    // once the host skipped the late ones. Held near its usual lead, it doesn't need to.
+    const clock = now / TICK_MS;
+    const maxL = clock + Math.min(...this.leads.map((l) => l.ticks)) + LEAD_SLACK;
+    const fresh = predict?.(newest, live, maxL) ?? null;
+    if (fresh) {
+      // Trimmed only as new leads come, so a stall long enough to stop prediction still finds the usual lead after it.
+      this.leads.push({ at: now, ticks: fresh.L + fresh.skipped - clock });
+      while (this.leads[0].at < now - LEAD_MS) this.leads.shift();
+    }
     // While acks stop coming, keep drawing from the last prediction instead of falling back to a stale snapshot.
-    const pred = predict?.(newest, live) ?? (predict && live && this.base?.snap === newest ? this.base.lead : null);
+    const pred = fresh ?? (predict && live && this.base?.snap === newest ? this.base.lead : null);
     const lead = pred && pred.puck.length > 0 ? pred : null;
 
     const known = Number.isFinite(this.puckTick);
@@ -329,7 +353,7 @@ export class GameState {
     const base = this.base;
     if (!resync && base && (base.predicted || lead) && (base.snap !== newest || base.predicted !== !!lead)) {
       // Your own input is the same in both, so only what the host changed is smoothed.
-      const old = base.predicted ? (predict?.(base.snap, base.live) ?? base.lead) : null;
+      const old = base.predicted ? (predict?.(base.snap, base.live, maxL) ?? base.lead) : null;
       const was = this.puckAt(tick, base.snap, old && old.puck.length > 0 ? old : null);
       const is = this.puckAt(tick, newest, lead);
       this.offsetX += was.x - is.x;
@@ -337,7 +361,7 @@ export class GameState {
     }
     const mallets = this.malletsOf(tick, newest, pred, !!lead);
     if (base?.pred && pred && base.snap !== newest) {
-      const old = predict?.(base.snap, base.live) ?? base.pred;
+      const old = predict?.(base.snap, base.live, maxL) ?? base.pred;
       const before = this.malletsOf(tick, base.snap, old, base.predicted);
       mallets.forEach((m, seat) => {
         const was = before[seat];
